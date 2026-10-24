@@ -88,12 +88,30 @@ struct Quad {
 
 struct SideGeom {
     int nameId = 0;
+    unsigned surfaceFlags = 0;
     PlaneD plane;
     double mins[3];
     double maxs[3];
     vector<Vec3> winding;
     int faceIndex = -1;
 };
+
+bool SideIsPortal(unsigned surfaceFlags)
+{
+    return (surfaceFlags & kSurfPortal) != 0;
+}
+
+bool SideIsVisibleSolid(unsigned surfaceFlags)
+{
+    return (surfaceFlags & kSurfPortal) == 0 && (surfaceFlags & kSurfNodraw) == 0;
+}
+
+bool IsPortalMapMaterial(unsigned surfaceFlags, const string& name)
+{
+    if ((surfaceFlags & kSurfPortal) != 0)
+        return true;
+    return name == "portal" || name == "portal_nodraw";
+}
 
 Vec3 Add(const Vec3& a, const Vec3& b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
 Vec3 Sub(const Vec3& a, const Vec3& b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
@@ -246,6 +264,678 @@ bool FacePoints(const vector<Vec3>& winding, const PlaneD& plane, Vec3 out[3])
     return Dot(PlaneFromPointsNormal(out[0], out[1], out[2]), n) > 0.0;
 }
 
+double RoundTripCoord(double v)
+{
+    if (!isfinite(v))
+        return 0;
+    double rounded = round(v);
+    if (fabs(v - rounded) < 1e-4)
+        return rounded;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.6f", v);
+    char* end = buf + strlen(buf);
+    while (end > buf && end[-1] == '0')
+        --end;
+    if (end > buf && end[-1] == '.')
+        --end;
+    *end = 0;
+    return strtod(buf, nullptr);
+}
+
+int RoundToInt(float value)
+{
+    volatile union {
+        double d;
+        int i[2];
+    } u;
+    u.d = (double)value + 9.313225746154785e-10 + 6755399441055744.0;
+    return u.i[0];
+}
+
+float Rint(float value)
+{
+    return floorf(value + 0.5f);
+}
+
+void LoadFacePoint(const Vec3& p, float out[3])
+{
+    out[0] = (float)RoundTripCoord(p.x);
+    out[1] = (float)RoundTripCoord(p.y);
+    out[2] = (float)RoundTripCoord(p.z);
+}
+
+void SnapFloatPlane(float p[4])
+{
+    for (int i = 0; i < 3; ++i) {
+        if (fabsf(p[i] - 1.f) < 1e-7f) {
+            p[0] = p[1] = p[2] = 0.f;
+            p[i] = 1.f;
+            break;
+        }
+        if (fabsf(p[i] + 1.f) < 1e-7f) {
+            p[0] = p[1] = p[2] = 0.f;
+            p[i] = -1.f;
+            break;
+        }
+    }
+    float snapped = Rint(p[3]);
+    if (fabsf(p[3] - snapped) < 0.001f)
+        p[3] = snapped;
+}
+
+float FloatDot(const float a[3], const float b[3])
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+void FloatCross(const float a[3], const float b[3], float out[3])
+{
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+double FloatDetTerm(float a, float b, float c, float d, float e)
+{
+    float ab = a * b;
+    float cd = c * d;
+    float sub = ab - cd;
+    float prod = sub * e;
+    return (double)prod;
+}
+
+bool PlaneFromFacePoints(const float p0[3], const float p1[3], const float p2[3], float out[4])
+{
+    float d1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
+    float d2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+    float n[3];
+    FloatCross(d2, d1, n);
+    float lenSq = FloatDot(n, n);
+    if (lenSq < 2.f) {
+        if (lenSq == 0.f)
+            return false;
+        if (lenSq < FloatDot(d1, d1) * FloatDot(d2, d2) * 0.000001f) {
+            float e1[3] = { p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2] };
+            float e2[3] = { p0[0] - p1[0], p0[1] - p1[1], p0[2] - p1[2] };
+            FloatCross(e2, e1, n);
+            lenSq = FloatDot(n, n);
+            if (lenSq == 0.f || lenSq < FloatDot(e1, e1) * FloatDot(e2, e2) * 0.000001f)
+                return false;
+        }
+    }
+    float len = sqrtf(lenSq);
+    out[0] = n[0] / len;
+    out[1] = n[1] / len;
+    out[2] = n[2] / len;
+    out[3] = FloatDot(p0, out);
+    SnapFloatPlane(out);
+    return true;
+}
+
+bool SameFloatPlane(const float* a, const float* b)
+{
+    return fabsf(a[0] - b[0]) < 1e-7f && fabsf(a[1] - b[1]) < 1e-7f
+        && fabsf(a[2] - b[2]) < 1e-7f && fabsf(a[3] - b[3]) < 0.001f;
+}
+
+bool IntersectFloatPlanes(const float* p0, const float* p1, const float* p2, float out[3])
+{
+    double det = FloatDetTerm(p1[1], p2[2], p2[1], p1[2], p0[0])
+               + FloatDetTerm(p2[1], p0[2], p0[1], p2[2], p1[0])
+               + FloatDetTerm(p0[1], p1[2], p1[1], p0[2], p2[0]);
+    if (fabs(det) < 0.001)
+        return false;
+    double inv = 1.0 / det;
+    out[0] = (float)((FloatDetTerm(p1[1], p2[2], p2[1], p1[2], p0[3])
+                    + FloatDetTerm(p2[1], p0[2], p0[1], p2[2], p1[3])
+                    + FloatDetTerm(p0[1], p1[2], p1[1], p0[2], p2[3])) * inv);
+    out[1] = (float)((FloatDetTerm(p1[2], p2[0], p2[2], p1[0], p0[3])
+                    + FloatDetTerm(p2[2], p0[0], p0[2], p2[0], p1[3])
+                    + FloatDetTerm(p0[2], p1[0], p1[2], p0[0], p2[3])) * inv);
+    out[2] = (float)((FloatDetTerm(p1[0], p2[1], p2[0], p1[1], p0[3])
+                    + FloatDetTerm(p2[0], p0[1], p0[0], p2[1], p1[3])
+                    + FloatDetTerm(p0[0], p1[1], p1[0], p0[1], p2[3])) * inv);
+    return true;
+}
+
+void SnapFloatPoint(float point[3], const float* p0, const float* p1, const float* p2)
+{
+    float snapped[3];
+    bool changed = false;
+    for (int i = 0; i < 3; ++i) {
+        float coord = (float)RoundToInt(point[i] / 0.25f) * 0.25f;
+        if (fabsf(coord - point[i]) < 0.01f) {
+            snapped[i] = coord;
+            changed = true;
+        } else {
+            snapped[i] = point[i];
+        }
+    }
+    if (!changed)
+        return;
+    const float* planes[3] = { p0, p1, p2 };
+    float maxError = 0.f;
+    float maxAllowed = 0.01f;
+    for (int i = 0; i < 3; ++i) {
+        float onSnap = fabsf(FloatDot(planes[i], snapped) - planes[i][3]);
+        if (maxError < onSnap)
+            maxError = onSnap;
+        float onPoint = fabsf(FloatDot(planes[i], point) - planes[i][3]);
+        if (maxAllowed < onPoint)
+            maxAllowed = onPoint;
+    }
+    if (maxError < maxAllowed) {
+        point[0] = snapped[0];
+        point[1] = snapped[1];
+        point[2] = snapped[2];
+    }
+}
+
+struct PlaneHit {
+    float slack = -1.f;
+    int tri[3] = { -1, -1, -1 };
+    int which = 0;
+};
+
+int BrushSolidPoints(const vector<FaceOut>& faces, float* worstSlack)
+{
+    int count = (int)faces.size();
+    if (worstSlack)
+        *worstSlack = -1.f;
+    if (count < 4)
+        return 0;
+    vector<float> planes((size_t)count * 4);
+    for (int i = 0; i < count; ++i) {
+        float p0[3], p1[3], p2[3];
+        LoadFacePoint(faces[i].p[0], p0);
+        LoadFacePoint(faces[i].p[1], p1);
+        LoadFacePoint(faces[i].p[2], p2);
+        if (!PlaneFromFacePoints(p0, p1, p2, &planes[(size_t)i * 4]))
+            return 0;
+    }
+    auto planeAt = [&](int i) -> const float* { return &planes[(size_t)i * 4]; };
+    int points = 0;
+    float slack = 1e30f;
+    for (int i = 0; i < count - 2; ++i) {
+        for (int j = i + 1; j < count - 1; ++j) {
+            if (SameFloatPlane(planeAt(i), planeAt(j)))
+                continue;
+            for (int k = j + 1; k < count; ++k) {
+                if (SameFloatPlane(planeAt(i), planeAt(k)) || SameFloatPlane(planeAt(j), planeAt(k)))
+                    continue;
+                float point[3];
+                if (!IntersectFloatPlanes(planeAt(i), planeAt(j), planeAt(k), point))
+                    continue;
+                SnapFloatPoint(point, planeAt(i), planeAt(j), planeAt(k));
+                bool outside = false;
+                for (int t = 0; t < count; ++t) {
+                    if (SameFloatPlane(planeAt(t), planeAt(i)) || SameFloatPlane(planeAt(t), planeAt(j))
+                        || SameFloatPlane(planeAt(t), planeAt(k)))
+                        continue;
+                    if (FloatDot(planeAt(t), point) - planeAt(t)[3] > 0.1f) {
+                        outside = true;
+                        break;
+                    }
+                }
+                if (outside)
+                    continue;
+                points++;
+                int ids[3] = { i, j, k };
+                for (int s = 0; s < 3; ++s) {
+                    const float* plane = planeAt(ids[s]);
+                    float err = FloatDot(plane, point) - plane[3];
+                    float tol = 0.1f;
+                    float scaled = fabsf(plane[3]) * 0.00001f;
+                    if (scaled > tol)
+                        tol = scaled;
+                    slack = min(slack, tol - fabsf(err));
+                }
+            }
+        }
+    }
+    if (worstSlack)
+        *worstSlack = points > 0 ? slack : -1.f;
+    return points;
+}
+
+PlaneHit AuditFacePlanes(const vector<FaceOut>& faces)
+{
+    PlaneHit hit;
+    int count = (int)faces.size();
+    if (count < 4)
+        return hit;
+    vector<float> planes((size_t)count * 4);
+    for (int i = 0; i < count; ++i) {
+        float p0[3], p1[3], p2[3];
+        LoadFacePoint(faces[i].p[0], p0);
+        LoadFacePoint(faces[i].p[1], p1);
+        LoadFacePoint(faces[i].p[2], p2);
+        if (!PlaneFromFacePoints(p0, p1, p2, &planes[(size_t)i * 4])) {
+            hit.slack = -1000.f;
+            hit.tri[0] = i;
+            return hit;
+        }
+    }
+    auto planeAt = [&](int i) -> const float* { return &planes[(size_t)i * 4]; };
+    int inside = 0;
+    float worst = 1e30f;
+    for (int i = 0; i < count; ++i) {
+        for (int j = i + 1; j < count; ++j) {
+            if (SameFloatPlane(planeAt(i), planeAt(j)))
+                continue;
+            for (int k = j + 1; k < count; ++k) {
+                if (SameFloatPlane(planeAt(i), planeAt(k)) || SameFloatPlane(planeAt(j), planeAt(k)))
+                    continue;
+                float point[3];
+                if (!IntersectFloatPlanes(planeAt(i), planeAt(j), planeAt(k), point))
+                    continue;
+                SnapFloatPoint(point, planeAt(i), planeAt(j), planeAt(k));
+                bool outside = false;
+                for (int t = 0; t < count; ++t) {
+                    if (t == i || t == j || t == k)
+                        continue;
+                    if (SameFloatPlane(planeAt(t), planeAt(i)) || SameFloatPlane(planeAt(t), planeAt(j))
+                        || SameFloatPlane(planeAt(t), planeAt(k)))
+                        continue;
+                    float dist = FloatDot(planeAt(t), point) - planeAt(t)[3];
+                    if (dist > 0.1f) {
+                        outside = true;
+                        break;
+                    }
+                }
+                if (outside)
+                    continue;
+                inside++;
+                int ids[3] = { i, j, k };
+                for (int s = 0; s < 3; ++s) {
+                    const float* plane = planeAt(ids[s]);
+                    float err = FloatDot(plane, point) - plane[3];
+                    float tol = 0.1f;
+                    float scaled = fabsf(plane[3]) * 0.00001f;
+                    if (scaled > tol)
+                        tol = scaled;
+                    float slack = tol - fabsf(err);
+                    if (slack < worst) {
+                        worst = slack;
+                        hit.slack = slack;
+                        hit.tri[0] = i;
+                        hit.tri[1] = j;
+                        hit.tri[2] = k;
+                        hit.which = s;
+                    }
+                }
+            }
+        }
+    }
+    if (inside == 0) {
+        hit.slack = -1.f;
+        hit.tri[0] = hit.tri[1] = hit.tri[2] = -1;
+    }
+    return hit;
+}
+
+bool PointsOnPlane(const PlaneD& plane, const Vec3& anchor, float span, float spin, Vec3 out[3])
+{
+    float n[3] = { (float)plane.n[0], (float)plane.n[1], (float)plane.n[2] };
+    float len = sqrtf(FloatDot(n, n));
+    if (len < 1e-12f)
+        return false;
+    n[0] /= len;
+    n[1] /= len;
+    n[2] /= len;
+    float dist = n[0] * (float)anchor.x + n[1] * (float)anchor.y + n[2] * (float)anchor.z;
+
+    int axis = 0;
+    if (fabsf(n[1]) > fabsf(n[axis]))
+        axis = 1;
+    if (fabsf(n[2]) > fabsf(n[axis]))
+        axis = 2;
+    float tmp[3] = {};
+    tmp[(axis + 1) % 3] = 1.f;
+    float along = FloatDot(tmp, n);
+    float u[3] = { tmp[0] - along * n[0], tmp[1] - along * n[1], tmp[2] - along * n[2] };
+    float ulen = sqrtf(FloatDot(u, u));
+    if (ulen < 1e-12f)
+        return false;
+    u[0] /= ulen;
+    u[1] /= ulen;
+    u[2] /= ulen;
+    float v[3];
+    FloatCross(n, u, v);
+
+    float cs = cosf(spin);
+    float sn = sinf(spin);
+    float ur[3], vr[3];
+    for (int i = 0; i < 3; ++i) {
+        ur[i] = cs * u[i] + sn * v[i];
+        vr[i] = -sn * u[i] + cs * v[i];
+    }
+
+    float center[3] = { (float)anchor.x, (float)anchor.y, (float)anchor.z };
+    float shift = FloatDot(center, n) - dist;
+    center[0] -= shift * n[0];
+    center[1] -= shift * n[1];
+    center[2] -= shift * n[2];
+    float room = 120000.f;
+    for (int i = 0; i < 3; ++i)
+        room = min(room, 120000.f - fabsf(center[i]));
+    if (span > room)
+        span = room;
+    if (span < 64.f)
+        span = 64.f;
+
+    auto place = [&](float su, float sv, float dest[3]) {
+        dest[0] = center[0] + ur[0] * su + vr[0] * sv;
+        dest[1] = center[1] + ur[1] * su + vr[1] * sv;
+        dest[2] = center[2] + ur[2] * su + vr[2] * sv;
+        int uAxis = (axis + 1) % 3;
+        int vAxis = (axis + 2) % 3;
+        dest[axis] = (dist - n[uAxis] * dest[uAxis] - n[vAxis] * dest[vAxis]) / n[axis];
+    };
+    float raw[3][3];
+    place(0.f, 0.f, raw[0]);
+    place(0.f, span, raw[1]);
+    place(span, 0.f, raw[2]);
+    for (int i = 0; i < 3; ++i) {
+        out[i].x = RoundTripCoord(raw[i][0]);
+        out[i].y = RoundTripCoord(raw[i][1]);
+        out[i].z = RoundTripCoord(raw[i][2]);
+    }
+    float p0[3], p1[3], p2[3], recovered[4];
+    LoadFacePoint(out[0], p0);
+    LoadFacePoint(out[1], p1);
+    LoadFacePoint(out[2], p2);
+    if (!PlaneFromFacePoints(p0, p1, p2, recovered))
+        return false;
+    float align = FloatDot(recovered, n);
+    if (align < 0.f) {
+        swap(out[1], out[2]);
+        align = -align;
+    }
+    return align > 0.999f;
+}
+
+void ApplyPlanePoints(vector<FaceOut>& faces, const vector<PlaneD>& planes, const vector<Vec3>& anchors,
+                      float span, float spin)
+{
+    for (int i = 0; i < (int)faces.size(); ++i) {
+        Vec3 tri[3];
+        if (PointsOnPlane(planes[i], anchors[i], span, spin, tri)) {
+            faces[i].p[0] = tri[0];
+            faces[i].p[1] = tri[1];
+            faces[i].p[2] = tri[2];
+        }
+    }
+}
+
+bool SnapNearAxial(PlaneD& plane, const Vec3& anchor, double extent)
+{
+    int axis = 0;
+    double dominant = fabs(plane.n[0]);
+    for (int i = 1; i < 3; ++i) {
+        if (fabs(plane.n[i]) > dominant) {
+            dominant = fabs(plane.n[i]);
+            axis = i;
+        }
+    }
+    double off = sqrt(max(0.0, 1.0 - dominant * dominant));
+    if (off * max(extent, 1.0) > 0.05 || dominant < 0.5)
+        return false;
+    double sign = plane.n[axis] < 0.0 ? -1.0 : 1.0;
+    double anchorCoord = axis == 0 ? anchor.x : axis == 1 ? anchor.y : anchor.z;
+    plane.n[0] = plane.n[1] = plane.n[2] = 0.0;
+    plane.n[axis] = sign;
+    plane.dist = sign * anchorCoord;
+    return true;
+}
+
+void CollapseIllConditioned(vector<FaceOut>& faces, const vector<Vec3>& anchors)
+{
+    if (faces.size() < 4)
+        return;
+    for (int step = 0; step < (int)faces.size(); ++step) {
+        PlaneHit hit = AuditFacePlanes(faces);
+        if (hit.tri[0] < 0 || hit.tri[1] < 0 || hit.tri[2] < 0 || hit.slack >= 0.05f)
+            return;
+        int id[3] = { hit.tri[0], hit.tri[1], hit.tri[2] };
+        float pl[3][4];
+        for (int s = 0; s < 3; ++s) {
+            if (id[s] < 0 || id[s] >= (int)faces.size())
+                return;
+            float p0[3], p1[3], p2[3];
+            LoadFacePoint(faces[id[s]].p[0], p0);
+            LoadFacePoint(faces[id[s]].p[1], p1);
+            LoadFacePoint(faces[id[s]].p[2], p2);
+            if (!PlaneFromFacePoints(p0, p1, p2, pl[s]))
+                return;
+        }
+        int keep = id[0];
+        int drop = id[1];
+        int keepLocal = 0;
+        int dropLocal = 1;
+        float bestDot = -2.f;
+        for (int a = 0; a < 3; ++a) {
+            for (int b = a + 1; b < 3; ++b) {
+                float dot = FloatDot(pl[a], pl[b]);
+                if (dot > bestDot) {
+                    bestDot = dot;
+                    keep = id[a];
+                    drop = id[b];
+                    keepLocal = a;
+                    dropLocal = b;
+                }
+            }
+        }
+        if (bestDot < 0.75f)
+            return;
+        if (anchors.size() == faces.size() && bestDot < 0.999f) {
+            auto gap = [](const float* plane, const Vec3& p) {
+                return fabs(plane[0] * p.x + plane[1] * p.y + plane[2] * p.z - plane[3]);
+            };
+            double sep = max(gap(pl[keepLocal], anchors[drop]), gap(pl[dropLocal], anchors[keep]));
+            if (sep > 0.1)
+                return;
+        }
+        Vec3 saved[3] = { faces[drop].p[0], faces[drop].p[1], faces[drop].p[2] };
+        if (saved[0].x == faces[keep].p[0].x && saved[0].y == faces[keep].p[0].y && saved[0].z == faces[keep].p[0].z
+            && saved[1].x == faces[keep].p[1].x && saved[1].y == faces[keep].p[1].y && saved[1].z == faces[keep].p[1].z
+            && saved[2].x == faces[keep].p[2].x && saved[2].y == faces[keep].p[2].y && saved[2].z == faces[keep].p[2].z)
+            return;
+        faces[drop].p[0] = faces[keep].p[0];
+        faces[drop].p[1] = faces[keep].p[1];
+        faces[drop].p[2] = faces[keep].p[2];
+        PlaneHit next = AuditFacePlanes(faces);
+        if (next.slack <= hit.slack) {
+            faces[drop].p[0] = saved[0];
+            faces[drop].p[1] = saved[1];
+            faces[drop].p[2] = saved[2];
+            return;
+        }
+    }
+}
+
+void FitBrushPlanes(vector<FaceOut>& faces, const vector<PlaneD>& sourcePlanes, const vector<Vec3>& anchors)
+{
+    struct SealIllConditioned {
+        vector<FaceOut>* faces;
+        const vector<Vec3>* anchors;
+        ~SealIllConditioned()
+        {
+            if (faces && anchors)
+                CollapseIllConditioned(*faces, *anchors);
+        }
+    } seal{ &faces, &anchors };
+    if (faces.size() < 4 || faces.size() != sourcePlanes.size() || faces.size() != anchors.size())
+        return;
+    vector<PlaneD> planes = sourcePlanes;
+    vector<Vec3> onPlane(anchors.size());
+    double extent = 0;
+    for (int i = 0; i < (int)planes.size(); ++i) {
+        double dist = planes[i].Dist(anchors[i]);
+        onPlane[i] = { anchors[i].x - planes[i].n[0] * dist, anchors[i].y - planes[i].n[1] * dist,
+                       anchors[i].z - planes[i].n[2] * dist };
+        for (int j = 0; j < i; ++j)
+            extent = max(extent, Len(Sub(onPlane[i], onPlane[j])));
+    }
+    if (extent < 1)
+        extent = 1;
+    bool snapped = false;
+    for (int i = 0; i < (int)planes.size(); ++i)
+        snapped = SnapNearAxial(planes[i], onPlane[i], extent) || snapped;
+
+    auto capture = [&]() {
+        vector<Vec3> saved;
+        saved.reserve(faces.size() * 3);
+        for (const FaceOut& face : faces)
+            for (int k = 0; k < 3; ++k)
+                saved.push_back(face.p[k]);
+        return saved;
+    };
+    auto restore = [&](const vector<Vec3>& saved) {
+        int at = 0;
+        for (FaceOut& face : faces)
+            for (int k = 0; k < 3; ++k)
+                face.p[k] = saved[at++];
+    };
+
+    vector<Vec3> bestPoints = capture();
+    PlaneHit best = AuditFacePlanes(faces);
+    if (snapped) {
+        ApplyPlanePoints(faces, planes, onPlane, 4096.f, 0.f);
+        PlaneHit hit = AuditFacePlanes(faces);
+        if (hit.slack >= best.slack) {
+            best = hit;
+            bestPoints = capture();
+        }
+        restore(bestPoints);
+    }
+    if (best.slack >= 0.04f)
+        return;
+
+    const float spans[] = { 1024.f, 2048.f, 3072.f, 4096.f, 6144.f, 8192.f, 12288.f };
+    const float spins[] = { 0.f, 0.2f, 0.45f, 0.7f, 1.0f, 1.4f, 1.9f, 2.4f };
+    float useSpan = 4096.f;
+    float useSpin = 0.f;
+    for (float span : spans) {
+        for (float spin : spins) {
+            ApplyPlanePoints(faces, planes, onPlane, span, spin);
+            PlaneHit hit = AuditFacePlanes(faces);
+            if (hit.slack > best.slack) {
+                best = hit;
+                bestPoints = capture();
+                useSpan = span;
+                useSpin = spin;
+            }
+            if (best.slack >= 0.04f) {
+                restore(bestPoints);
+                return;
+            }
+        }
+    }
+    restore(bestPoints);
+
+    vector<PlaneD> live = planes;
+    double moveCap = 0.5 / extent;
+    for (int step = 0; step < 12 && best.slack < 0.04f && best.tri[0] >= 0; ++step) {
+        int index = best.tri[best.which];
+        int otherA = best.tri[(best.which + 1) % 3];
+        int otherB = best.tri[(best.which + 2) % 3];
+        float pa[4], pb[4];
+        float a0[3], a1[3], a2[3], b0[3], b1[3], b2[3];
+        LoadFacePoint(faces[otherA].p[0], a0);
+        LoadFacePoint(faces[otherA].p[1], a1);
+        LoadFacePoint(faces[otherA].p[2], a2);
+        LoadFacePoint(faces[otherB].p[0], b0);
+        LoadFacePoint(faces[otherB].p[1], b1);
+        LoadFacePoint(faces[otherB].p[2], b2);
+        if (!PlaneFromFacePoints(a0, a1, a2, pa) || !PlaneFromFacePoints(b0, b1, b2, pb))
+            break;
+        float dir[3];
+        FloatCross(pa, pb, dir);
+        float dirLen = sqrtf(FloatDot(dir, dir));
+        if (dirLen < 1e-8f)
+            break;
+        dir[0] /= dirLen;
+        dir[1] /= dirLen;
+        dir[2] /= dirLen;
+
+        bool improved = false;
+        PlaneD base = live[index];
+        const double epsilons[] = { 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3 };
+        for (double eps : epsilons) {
+            if (eps > moveCap)
+                break;
+            for (double sign : { 1.0, -1.0 }) {
+                PlaneD trial = base;
+                trial.n[0] += dir[0] * eps * sign;
+                trial.n[1] += dir[1] * eps * sign;
+                trial.n[2] += dir[2] * eps * sign;
+                double nlen = sqrt(trial.n[0] * trial.n[0] + trial.n[1] * trial.n[1] + trial.n[2] * trial.n[2]);
+                if (nlen < 1e-12)
+                    continue;
+                trial.n[0] /= nlen;
+                trial.n[1] /= nlen;
+                trial.n[2] /= nlen;
+                if (trial.n[0] * planes[index].n[0] + trial.n[1] * planes[index].n[1] + trial.n[2] * planes[index].n[2] < 0.999)
+                    continue;
+                trial.dist = trial.n[0] * onPlane[index].x + trial.n[1] * onPlane[index].y + trial.n[2] * onPlane[index].z;
+                Vec3 tri[3];
+                if (!PointsOnPlane(trial, onPlane[index], useSpan, useSpin, tri))
+                    continue;
+                faces[index].p[0] = tri[0];
+                faces[index].p[1] = tri[1];
+                faces[index].p[2] = tri[2];
+                PlaneHit hit = AuditFacePlanes(faces);
+                if (hit.slack > best.slack + 1e-5f) {
+                    best = hit;
+                    bestPoints = capture();
+                    live[index] = trial;
+                    improved = true;
+                    if (best.slack >= 0.04f)
+                        break;
+                }
+            }
+            if (best.slack >= 0.04f)
+                break;
+        }
+        restore(bestPoints);
+        if (best.slack >= 0.04f)
+            break;
+        if (!improved) {
+            bool shifted = false;
+            const double shifts[] = { 0.002, 0.01, 0.05 };
+            for (double shift : shifts) {
+                for (double sign : { 1.0, -1.0 }) {
+                    PlaneD trial = base;
+                    trial.dist += shift * sign;
+                    Vec3 tri[3];
+                    if (!PointsOnPlane(trial, onPlane[index], useSpan, useSpin, tri))
+                        continue;
+                    faces[index].p[0] = tri[0];
+                    faces[index].p[1] = tri[1];
+                    faces[index].p[2] = tri[2];
+                    PlaneHit hit = AuditFacePlanes(faces);
+                    if (hit.slack > best.slack + 1e-5f) {
+                        best = hit;
+                        bestPoints = capture();
+                        live[index] = trial;
+                        shifted = true;
+                        if (best.slack >= 0.04f)
+                            break;
+                    }
+                }
+                if (best.slack >= 0.04f)
+                    break;
+            }
+            restore(bestPoints);
+            if (!shifted)
+                break;
+        }
+        restore(bestPoints);
+    }
+    restore(bestPoints);
+}
+
 void OrientWinding(vector<Vec3>& winding, const PlaneD& plane)
 {
     if (winding.size() < 3)
@@ -282,6 +972,61 @@ double MinorSpan(const vector<Vec3>& winding, const PlaneD& plane)
     return min(maxU - minU, maxV - minV);
 }
 
+double WindingArea(const vector<Vec3>& winding, const PlaneD& plane)
+{
+    if (winding.size() < 3)
+        return 0;
+    Vec3 n = { plane.n[0], plane.n[1], plane.n[2] };
+    Vec3 area{ 0, 0, 0 };
+    for (size_t i = 1; i + 1 < winding.size(); ++i)
+        area = Add(area, Cross(Sub(winding[i], winding[0]), Sub(winding[i + 1], winding[0])));
+    return fabs(Dot(area, n)) * 0.5;
+}
+
+bool IsAxialPlane(const PlaneD& p, double eps = 1e-3)
+{
+    int nonzero = 0;
+    bool unit = false;
+    for (int i = 0; i < 3; ++i) {
+        if (fabs(p.n[i]) > eps)
+            ++nonzero;
+        if (fabs(fabs(p.n[i]) - 1.0) < eps)
+            unit = true;
+    }
+    return nonzero == 1 && unit;
+}
+
+PlaneD NegatePlane(const PlaneD& p)
+{
+    return { { -p.n[0], -p.n[1], -p.n[2] }, -p.dist };
+}
+
+bool SamePlane(const PlaneD& a, const PlaneD& b, double nEps = 0.02, double dEps = 1.0)
+{
+    return fabs(a.n[0] - b.n[0]) < nEps && fabs(a.n[1] - b.n[1]) < nEps
+        && fabs(a.n[2] - b.n[2]) < nEps && fabs(a.dist - b.dist) < dEps;
+}
+
+constexpr double kEdgeLength = 0.2;
+
+bool WindingIsTiny(const vector<Vec3>& w)
+{
+    if (w.size() < 3)
+        return true;
+    int edgeCount = 0;
+    for (size_t i = 0, j = w.size() - 1; i < w.size(); j = i, ++i) {
+        const double dx = w[i].x - w[j].x;
+        const double dy = w[i].y - w[j].y;
+        const double dz = w[i].z - w[j].z;
+        if (dx * dx + dy * dy + dz * dz > kEdgeLength * kEdgeLength) {
+            ++edgeCount;
+            if (edgeCount == 3)
+                return false;
+        }
+    }
+    return true;
+}
+
 bool Solve3(const double m[3][3], const double b[3], double x[3]);
 
 bool IntersectPlanes(const PlaneD& a, const PlaneD& b, const PlaneD& c, Vec3& out)
@@ -297,6 +1042,134 @@ bool IntersectPlanes(const PlaneD& a, const PlaneD& b, const PlaneD& c, Vec3& ou
         return false;
     out = { x[0], x[1], x[2] };
     return true;
+}
+
+vector<Vec3> HullPoints(const vector<PlaneD>& planes, double eps = 0.05)
+{
+    vector<Vec3> verts;
+    const int n = (int)planes.size();
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            for (int k = j + 1; k < n; ++k) {
+                Vec3 pt;
+                if (!IntersectPlanes(planes[i], planes[j], planes[k], pt))
+                    continue;
+                bool inside = true;
+                for (const PlaneD& p : planes) {
+                    if (p.Dist(pt) > eps) {
+                        inside = false;
+                        break;
+                    }
+                }
+                if (inside)
+                    verts.push_back(pt);
+            }
+        }
+    }
+    return verts;
+}
+
+vector<PlaneD> KeepAreaPlanes(const vector<PlaneD>& planes)
+{
+    vector<PlaneD> kept;
+    for (int i = 0; i < (int)planes.size(); ++i) {
+        vector<Vec3> winding = BaseWinding(planes[i]);
+        for (int j = 0; j < (int)planes.size() && !winding.empty(); ++j) {
+            if (j == i)
+                continue;
+            winding = ClipWinding(winding, planes[j]);
+        }
+        OrientWinding(winding, planes[i]);
+        if (!WindingIsTiny(winding))
+            kept.push_back(planes[i]);
+    }
+    return kept;
+}
+
+vector<PlaneD> RecoverPortalPlanes(const vector<PlaneD>& planes, const vector<PlaneD>& neighborPlanes)
+{
+    vector<PlaneD> trial = KeepAreaPlanes(planes);
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        vector<Vec3> verts = HullPoints(trial);
+        if (verts.empty())
+            break;
+        Vec3 centroid{ 0, 0, 0 };
+        for (const Vec3& v : verts)
+            centroid = Add(centroid, v);
+        centroid = Mul(centroid, 1.0 / (double)verts.size());
+
+        vector<int> axialIdx;
+        for (int i = 0; i < (int)trial.size(); ++i) {
+            if (IsAxialPlane(trial[i]))
+                axialIdx.push_back(i);
+        }
+        if (axialIdx.empty())
+            break;
+
+        int bestKilled = 0;
+        double bestArea = -1;
+        PlaneD bestCand{};
+        bool have = false;
+
+        auto consider = [&](const PlaneD& cand) {
+            if (IsAxialPlane(cand))
+                return;
+            for (const PlaneD& p : trial) {
+                if (SamePlane(cand, p) || SamePlane(NegatePlane(cand), p))
+                    return;
+            }
+            if (cand.Dist(centroid) > 0.1)
+                return;
+            int onHull = 0;
+            for (const Vec3& v : verts) {
+                if (fabs(cand.Dist(v)) <= 0.5)
+                    ++onHull;
+            }
+            if (onHull < 2)
+                return;
+            vector<PlaneD> neu = trial;
+            neu.push_back(cand);
+            vector<Vec3> winding = BaseWinding(cand);
+            for (int j = 0; j < (int)neu.size() - 1 && !winding.empty(); ++j)
+                winding = ClipWinding(winding, neu[j]);
+            OrientWinding(winding, cand);
+            if (WindingIsTiny(winding))
+                return;
+            double area = WindingArea(winding, cand);
+            int killed = 0;
+            for (int ai : axialIdx) {
+                vector<Vec3> aw = BaseWinding(neu[ai]);
+                for (int j = 0; j < (int)neu.size() && !aw.empty(); ++j) {
+                    if (j == ai)
+                        continue;
+                    aw = ClipWinding(aw, neu[j]);
+                }
+                if (WindingIsTiny(aw))
+                    ++killed;
+            }
+            if (killed <= 0)
+                return;
+            if (!have || killed > bestKilled || (killed == bestKilled && area > bestArea)) {
+                have = true;
+                bestKilled = killed;
+                bestArea = area;
+                bestCand = cand;
+            }
+        };
+
+        for (const PlaneD& raw : neighborPlanes) {
+            consider(raw);
+            consider(NegatePlane(raw));
+        }
+        if (have) {
+            trial.push_back(bestCand);
+            trial = KeepAreaPlanes(trial);
+            changed = true;
+        }
+    }
+    return trial;
 }
 
 bool InsideConvex(const vector<Vec3>& w, const Vec3& p, const Vec3& n, double slop)
@@ -552,20 +1425,185 @@ struct BuiltSides {
     vector<SideGeom> sides;
 };
 
+bool EmitFacesFromPlanes(const vector<PlaneD>& planes, const string& material, int nameId,
+                         unsigned surfaceFlags, BrushOut& brush, BuiltSides& sides)
+{
+    brush.faces.clear();
+    sides.sides.clear();
+    for (int i = 0; i < (int)planes.size(); ++i) {
+        vector<Vec3> winding = BaseWinding(planes[i]);
+        for (int j = 0; j < (int)planes.size() && !winding.empty(); ++j) {
+            if (j == i)
+                continue;
+            winding = ClipWinding(winding, planes[j]);
+        }
+        OrientWinding(winding, planes[i]);
+        if (WindingIsTiny(winding))
+            continue;
+        Vec3 tri[3];
+        if (!FacePoints(winding, planes[i], tri))
+            continue;
+        FaceOut face;
+        face.p[0] = tri[0];
+        face.p[1] = tri[1];
+        face.p[2] = tri[2];
+        face.material = material;
+        brush.faces.push_back(face);
+        SideGeom side;
+        side.nameId = nameId;
+        side.surfaceFlags = surfaceFlags;
+        side.plane = planes[i];
+        side.faceIndex = (int)brush.faces.size() - 1;
+        BoundsOf(winding, side.mins, side.maxs);
+        side.winding = move(winding);
+        sides.sides.push_back(move(side));
+    }
+    float solidSlack = 0.f;
+    return BrushSolidPoints(brush.faces, &solidSlack) >= 4 && solidSlack >= 0.04f;
+}
+
+void RecoverPortalBrushes(vector<BrushOut>& brushes, vector<SideGeom>& allSides,
+                          vector<int>& brushSideStart, const Names& names, int caulk)
+{
+    const int n = (int)brushes.size();
+    if (n == 0)
+        return;
+
+    vector<vector<PlaneD>> planes(n);
+    vector<char> isPortal(n, 0);
+    vector<int> portalNameId(n, caulk);
+    vector<string> portalMat(n);
+    vector<unsigned> portalFlags(n, kSurfPortal);
+
+    for (int b = 0; b < n; ++b) {
+        int begin = brushSideStart[b];
+        int end = brushSideStart[b + 1];
+        if (caulk >= 0 && caulk < (int)names.list.size())
+            portalMat[b] = names.list[caulk];
+        for (int i = begin; i < end; ++i) {
+            planes[b].push_back(allSides[i].plane);
+            if (SideIsPortal(allSides[i].surfaceFlags)) {
+                isPortal[b] = 1;
+                portalNameId[b] = allSides[i].nameId;
+                portalFlags[b] = allSides[i].surfaceFlags;
+                int fi = allSides[i].faceIndex;
+                if (fi >= 0 && fi < (int)brushes[b].faces.size())
+                    portalMat[b] = brushes[b].faces[fi].material;
+            }
+        }
+    }
+
+    bool any = false;
+    vector<BuiltSides> rebuilt(n);
+    vector<char> changed(n, 0);
+    for (int b = 0; b < n; ++b) {
+        if (!isPortal[b])
+            continue;
+        vector<PlaneD> neighbors;
+        for (int o = 0; o < n; ++o) {
+            if (o == b || !isPortal[o])
+                continue;
+            int begin = brushSideStart[o];
+            int end = brushSideStart[o + 1];
+            for (int s = begin; s < end; ++s) {
+                if (IsAxialPlane(allSides[s].plane))
+                    continue;
+                neighbors.push_back(allSides[s].plane);
+            }
+        }
+        if (neighbors.empty())
+            continue;
+        vector<PlaneD> recovered = RecoverPortalPlanes(planes[b], neighbors);
+        if (recovered.size() == planes[b].size()) {
+            bool same = true;
+            for (size_t i = 0; i < recovered.size() && same; ++i) {
+                bool found = false;
+                for (const PlaneD& p : planes[b]) {
+                    if (SamePlane(recovered[i], p)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                    same = false;
+            }
+            if (same)
+                continue;
+        }
+        BrushOut trial = brushes[b];
+        BuiltSides trialSides;
+        if (!EmitFacesFromPlanes(recovered, portalMat[b], portalNameId[b], portalFlags[b], trial, trialSides))
+            continue;
+        for (size_t i = 0; i < trialSides.sides.size(); ++i) {
+            for (size_t j = 0; j < planes[b].size(); ++j) {
+                if (!SamePlane(trialSides.sides[i].plane, planes[b][j]))
+                    continue;
+                int begin = brushSideStart[b];
+                int end = brushSideStart[b + 1];
+                for (int s = begin; s < end; ++s) {
+                    if (!SamePlane(allSides[s].plane, planes[b][j]))
+                        continue;
+                    trialSides.sides[i].nameId = allSides[s].nameId;
+                    trialSides.sides[i].surfaceFlags = allSides[s].surfaceFlags;
+                    int oldFace = allSides[s].faceIndex;
+                    if (oldFace >= 0 && oldFace < (int)brushes[b].faces.size())
+                        trial.faces[i].material = brushes[b].faces[oldFace].material;
+                    break;
+                }
+                break;
+            }
+        }
+        brushes[b] = move(trial);
+        rebuilt[b] = move(trialSides);
+        changed[b] = 1;
+        any = true;
+    }
+    if (!any)
+        return;
+
+    vector<SideGeom> neu;
+    vector<int> neuStart;
+    neuStart.push_back(0);
+    for (int b = 0; b < n; ++b) {
+        if (changed[b]) {
+            for (SideGeom& s : rebuilt[b].sides)
+                neu.push_back(move(s));
+        } else {
+            for (int i = brushSideStart[b]; i < brushSideStart[b + 1]; ++i)
+                neu.push_back(move(allSides[i]));
+        }
+        neuStart.push_back((int)neu.size());
+    }
+    allSides = move(neu);
+    brushSideStart = move(neuStart);
+}
+
+static int gDropSides = 0;
+static int gDropMat = 0;
+static int gDropPlane = 0;
+static int gDropFaces = 0;
+static int gDropSolid = 0;
+
 bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& origin,
                 const vector<int>& matName, const Names& names, int caulk,
                 const vector<int>& edgeStart, BrushOut& brush, BuiltSides& sides)
 {
     const BspBrush& src = bsp.brushes[brushIndex];
-    if (src.numSides < 4)
+    if (src.numSides < 4) {
+        ++gDropSides;
         return false;
-    if (src.materialNum >= bsp.materials.size())
+    }
+    if (src.materialNum >= bsp.materials.size()) {
+        ++gDropMat;
         return false;
+    }
 
     vector<PlaneD> planes(src.numSides);
     for (int local = 0; local < src.numSides; ++local) {
-        if (!MakePlane(bsp, bsp.sides[sideStart + local], local, origin, planes[local]))
+        if (!MakePlane(bsp, bsp.sides[sideStart + local], local, origin, planes[local])) {
+            ++gDropPlane;
             return false;
+        }
     }
 
     brush.contents = bsp.materials[src.materialNum].contentFlags;
@@ -600,9 +1638,18 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
             }
         }
         OrientWinding(winding, planes[local]);
-        Vec3 tri[3];
-        if (!FacePoints(winding, planes[local], tri))
+        if (winding.size() < 3)
             continue;
+
+        Vec3 tri[3];
+        if (!FacePoints(winding, planes[local], tri)) {
+            Vec3 anchor{ 0, 0, 0 };
+            for (const Vec3& p : winding)
+                anchor = Add(anchor, p);
+            anchor = Mul(anchor, 1.0 / (double)winding.size());
+            if (!PointsOnPlane(planes[local], anchor, 4096.f, 0.f, tri))
+                continue;
+        }
 
         FaceOut face;
         face.p[0] = tri[0];
@@ -610,8 +1657,11 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
         face.p[2] = tri[2];
         unsigned matNum = bsp.sides[sideStart + local].materialNum;
         int nameId = caulk;
-        if (matNum < bsp.materials.size())
+        unsigned surfaceFlags = 0;
+        if (matNum < bsp.materials.size()) {
             nameId = matName[matNum];
+            surfaceFlags = bsp.materials[matNum].surfaceFlags;
+        }
         if (nameId < 0 || nameId >= (int)names.list.size())
             nameId = caulk;
         face.material = names.list[nameId];
@@ -619,6 +1669,7 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
 
         SideGeom side;
         side.nameId = nameId;
+        side.surfaceFlags = surfaceFlags;
         side.plane = planes[local];
         side.faceIndex = (int)brush.faces.size() - 1;
         BoundsOf(winding, side.mins, side.maxs);
@@ -626,32 +1677,59 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
         sides.sides.push_back(move(side));
     }
 
-    if (brush.faces.size() > 4) {
-        vector<char> drop(brush.faces.size(), 0);
-        int keep = 0;
-        for (int i = 0; i < (int)brush.faces.size(); ++i) {
-            if (MinorSpan(sides.sides[i].winding, sides.sides[i].plane) < 0.75)
-                drop[i] = 1;
-            else
-                keep++;
+    bool hasPortalBit = false;
+    bool hasVisibleSolid = false;
+    for (size_t i = 0; i < sides.sides.size(); ++i) {
+        if (SideIsPortal(sides.sides[i].surfaceFlags))
+            hasPortalBit = true;
+        if (SideIsVisibleSolid(sides.sides[i].surfaceFlags))
+            hasVisibleSolid = true;
+    }
+    const bool portalBrush = hasPortalBit && !hasVisibleSolid;
+    if (!portalBrush) {
+        string caulkName = (caulk >= 0 && caulk < (int)names.list.size()) ? names.list[caulk] : string("caulk");
+        for (size_t i = 0; i < brush.faces.size(); ++i) {
+            const string& mat = brush.faces[i].material;
+            if (!IsPortalMapMaterial(sides.sides[i].surfaceFlags, mat))
+                continue;
+            brush.faces[i].material = caulkName;
+            sides.sides[i].nameId = caulk;
+            sides.sides[i].surfaceFlags = kSurfNodraw;
         }
-        if (keep >= 4) {
-            BrushOut kept;
-            kept.contents = brush.contents;
-            BuiltSides keptSides;
-            for (int i = 0; i < (int)brush.faces.size(); ++i) {
-                if (drop[i])
-                    continue;
-                sides.sides[i].faceIndex = (int)kept.faces.size();
-                kept.faces.push_back(move(brush.faces[i]));
-                keptSides.sides.push_back(move(sides.sides[i]));
-            }
-            brush = move(kept);
-            sides = move(keptSides);
-        }
+    } else {
+        brush.contents &= ~(unsigned)kContentsDetail;
     }
 
-    return brush.faces.size() >= 4;
+    if (brush.faces.size() >= 4 && brush.faces.size() == sides.sides.size()) {
+        vector<PlaneD> fitPlanes;
+        vector<Vec3> fitAnchors;
+        fitPlanes.reserve(brush.faces.size());
+        fitAnchors.reserve(brush.faces.size());
+        for (int i = 0; i < (int)sides.sides.size(); ++i) {
+            fitPlanes.push_back(sides.sides[i].plane);
+            Vec3 anchor{ 0, 0, 0 };
+            if (!sides.sides[i].winding.empty()) {
+                for (const Vec3& point : sides.sides[i].winding)
+                    anchor = Add(anchor, point);
+                anchor = Mul(anchor, 1.0 / (double)sides.sides[i].winding.size());
+            } else {
+                anchor = Mul(Add(Add(brush.faces[i].p[0], brush.faces[i].p[1]), brush.faces[i].p[2]), 1.0 / 3.0);
+            }
+            fitAnchors.push_back(anchor);
+        }
+        FitBrushPlanes(brush.faces, fitPlanes, fitAnchors);
+    }
+
+    if (brush.faces.size() < 4) {
+        ++gDropFaces;
+        return false;
+    }
+    float solidSlack = 0.f;
+    if (BrushSolidPoints(brush.faces, &solidSlack) < 4 || solidSlack < 0.04f) {
+        ++gDropSolid;
+        return false;
+    }
+    return true;
 }
 
 struct VertRef {
@@ -1931,6 +3009,8 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
         geo.brushes.push_back(move(brush));
     }
 
+    RecoverPortalBrushes(geo.brushes, allSides, brushSideStart, names, caulk);
+
     for (int b = 0; b < (int)geo.brushes.size(); ++b) {
         int begin = brushSideStart[b];
         int end = brushSideStart[b + 1];
@@ -2130,7 +3210,7 @@ bool RecoverClosedBrushes(const vector<WeldVert>& verts, const vector<Tri>& tris
             const Vec3& a = verts[tris[ti].a].p;
             const Vec3& b = verts[tris[ti].b].p;
             const Vec3& c = verts[tris[ti].c].p;
-            Vec3 n = Cross(Sub(b, a), Sub(c, a));
+            Vec3 n = Cross(Sub(c, a), Sub(b, a));
             double len = Len(n);
             if (len < 1e-4) {
                 bad = true;
@@ -2153,6 +3233,8 @@ bool RecoverClosedBrushes(const vector<WeldVert>& verts, const vector<Tri>& tris
         BrushOut brush;
         brush.contents = contents;
         bool closed = true;
+        vector<PlaneD> fitPlanes;
+        vector<Vec3> fitAnchors;
         double bmin[3] = { 1e30, 1e30, 1e30 };
         double bmax[3] = { -1e30, -1e30, -1e30 };
         for (int p = 0; p < (int)planes.size(); ++p) {
@@ -2182,6 +3264,14 @@ bool RecoverClosedBrushes(const vector<WeldVert>& verts, const vector<Tri>& tris
             }
             FitFace(hits, planes[p].plane, face);
             brush.faces.push_back(face);
+            Vec3 anchor{ 0, 0, 0 };
+            if (!winding.empty()) {
+                for (const Vec3& point : winding)
+                    anchor = Add(anchor, point);
+                anchor = Mul(anchor, 1.0 / (double)winding.size());
+            }
+            fitPlanes.push_back(planes[p].plane);
+            fitAnchors.push_back(anchor);
             for (const Vec3& point : winding) {
                 bmin[0] = min(bmin[0], point.x); bmax[0] = max(bmax[0], point.x);
                 bmin[1] = min(bmin[1], point.y); bmax[1] = max(bmax[1], point.y);
@@ -2218,6 +3308,10 @@ bool RecoverClosedBrushes(const vector<WeldVert>& verts, const vector<Tri>& tris
         if (!inside)
             continue;
 
+        FitBrushPlanes(brush.faces, fitPlanes, fitAnchors);
+        float solidSlack = 0.f;
+        if (BrushSolidPoints(brush.faces, &solidSlack) < 4 || solidSlack < 0.04f)
+            continue;
         brushes.push_back(move(brush));
         for (int ti : ids)
             used[ti] = 1;
@@ -2235,18 +3329,25 @@ void SkipSpace(const char*& p)
 bool ParseQuoted(const char*& p, string& out)
 {
     SkipSpace(p);
-    if (*p != '"')
-        return false;
-    ++p;
     out.clear();
-    while (*p && *p != '"') {
+    if (*p == '"') {
+        ++p;
+        while (*p && *p != '"') {
+            out.push_back(*p);
+            ++p;
+        }
+        if (*p != '"')
+            return false;
+        ++p;
+        return true;
+    }
+    if (!*p || *p == '{' || *p == '}')
+        return false;
+    while (*p && !isspace((unsigned char)*p)) {
         out.push_back(*p);
         ++p;
     }
-    if (*p != '"')
-        return false;
-    ++p;
-    return true;
+    return !out.empty();
 }
 
 vector<Ent> ParseEntities(const string& text)
@@ -2575,8 +3676,11 @@ vector<BrushOut> BuildLightGridBrushes(const BspFile& bsp, const fs::path& bspPa
 
 void WriteGeometry(FILE* f, int& brushIndex, const ModelGeo& geo)
 {
-    for (const BrushOut& brush : geo.brushes)
+    for (const BrushOut& brush : geo.brushes) {
+        if (brush.faces.size() < 4)
+            continue;
         WriteBrush(f, brushIndex++, brush);
+    }
     for (const MeshOut& mesh : geo.meshes)
         WriteMesh(f, brushIndex++, mesh);
 }
@@ -2597,6 +3701,491 @@ void WriteProbe(FILE* f, int index, const BspProbe& probe)
         fprintf(f, "\"color_correction\" \"%s\"\n", name);
     }
     fputs("\"classname\" \"reflection_probe\"\n}\n", f);
+}
+
+float CodRint(float value)
+{
+    return (float)floor((double)(value + 0.5f));
+}
+
+void CodSnapPlane(float n[3], float* dist)
+{
+    for (int i = 0; i < 3; ++i) {
+        if (fabs(n[i] - 1.0f) < 1e-7) {
+            n[0] = n[1] = n[2] = 0.f;
+            n[i] = 1.f;
+            break;
+        }
+        if (fabs(n[i] - -1.0f) < 1e-7) {
+            n[0] = n[1] = n[2] = 0.f;
+            n[i] = -1.f;
+            break;
+        }
+    }
+    float snapped = CodRint(*dist);
+    if (fabs(*dist - snapped) < 0.001f)
+        *dist = snapped;
+}
+
+bool CodPlaneFromPoints(float plane[4], const float p0[3], const float p1[3], const float p2[3])
+{
+    float d1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
+    float d2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+    plane[0] = d2[1] * d1[2] - d2[2] * d1[1];
+    plane[1] = d2[2] * d1[0] - d2[0] * d1[2];
+    plane[2] = d2[0] * d1[1] - d2[1] * d1[0];
+    float lenSq = plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2];
+    if (lenSq < 2.f) {
+        if (lenSq == 0.f)
+            return false;
+        float d1sq = d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2];
+        float d2sq = d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2];
+        if (lenSq < d1sq * d2sq * 0.000001f) {
+            float e1[3] = { p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2] };
+            float e2[3] = { p0[0] - p1[0], p0[1] - p1[1], p0[2] - p1[2] };
+            plane[0] = e2[1] * e1[2] - e2[2] * e1[1];
+            plane[1] = e2[2] * e1[0] - e2[0] * e1[2];
+            plane[2] = e2[0] * e1[1] - e2[1] * e1[0];
+            lenSq = plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2];
+            float e1sq = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+            float e2sq = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+            if (lenSq == 0.f || lenSq < e1sq * e2sq * 0.000001f)
+                return false;
+        }
+    }
+    float len = (float)sqrt((double)lenSq);
+    plane[0] /= len;
+    plane[1] /= len;
+    plane[2] /= len;
+    plane[3] = plane[0] * p0[0] + plane[1] * p0[1] + plane[2] * p0[2];
+    return true;
+}
+
+bool CodFacePlane(const FaceOut& face, float plane[4])
+{
+    float p0[3], p1[3], p2[3];
+    LoadFacePoint(face.p[0], p0);
+    LoadFacePoint(face.p[1], p1);
+    LoadFacePoint(face.p[2], p2);
+    return CodPlaneFromPoints(plane, p0, p1, p2);
+}
+
+float CodDot(const float* a, const float* b)
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+bool CodIntersect(const float* p0, const float* p1, const float* p2, float out[3])
+{
+    double det = (double)((p1[1] * p2[2] - p2[1] * p1[2]) * p0[0])
+               + (double)((p2[1] * p0[2] - p0[1] * p2[2]) * p1[0])
+               + (double)((p0[1] * p1[2] - p1[1] * p0[2]) * p2[0]);
+    if (fabs(det) < (double)0.001f)
+        return false;
+    double inv = 1.0 / det;
+    out[0] = (float)(((double)((p1[1] * p2[2] - p2[1] * p1[2]) * p0[3])
+                    + (double)((p2[1] * p0[2] - p0[1] * p2[2]) * p1[3])
+                    + (double)((p0[1] * p1[2] - p1[1] * p0[2]) * p2[3])) * inv);
+    out[1] = (float)(((double)((p1[2] * p2[0] - p2[2] * p1[0]) * p0[3])
+                    + (double)((p2[2] * p0[0] - p0[2] * p2[0]) * p1[3])
+                    + (double)((p0[2] * p1[0] - p1[2] * p0[0]) * p2[3])) * inv);
+    out[2] = (float)(((double)((p1[0] * p2[1] - p2[0] * p1[1]) * p0[3])
+                    + (double)((p2[0] * p0[1] - p0[0] * p2[1]) * p1[3])
+                    + (double)((p0[0] * p1[1] - p1[0] * p0[1]) * p2[3])) * inv);
+    return true;
+}
+
+void CodSnapPoint(const float* p0, const float* p1, const float* p2, float point[3])
+{
+    float snapped[3];
+    for (int i = 0; i < 3; ++i) {
+        float grid = (float)RoundToInt(point[i] / 0.25f) * 0.25f;
+        snapped[i] = fabsf(grid - point[i]) < 0.01f ? grid : point[i];
+    }
+    if (snapped[0] == point[0] && snapped[1] == point[1] && snapped[2] == point[2])
+        return;
+    float maxError = 0.f;
+    float maxAllowed = 0.01f;
+    const float* planes[3] = { p0, p1, p2 };
+    for (int i = 0; i < 3; ++i) {
+        float onSnap = fabsf(CodDot(planes[i], snapped) - planes[i][3]);
+        if (maxError < onSnap)
+            maxError = onSnap;
+        float onPoint = fabsf(CodDot(planes[i], point) - planes[i][3]);
+        if (maxAllowed < onPoint)
+            maxAllowed = onPoint;
+    }
+    if (maxError < maxAllowed) {
+        point[0] = snapped[0];
+        point[1] = snapped[1];
+        point[2] = snapped[2];
+    }
+}
+
+struct CodMapPlane {
+    float n[3];
+    float d;
+    int hashNext;
+    int born;
+};
+
+struct CodPlanePool {
+    vector<CodMapPlane> planes;
+    int hash[1024];
+
+    CodPlanePool()
+    {
+        for (int i = 0; i < 1024; ++i)
+            hash[i] = -1;
+    }
+
+    void Save(int out[1024]) const { memcpy(out, hash, sizeof(hash)); }
+
+    void Restore(int count, const int saved[1024])
+    {
+        planes.resize(count);
+        memcpy(hash, saved, sizeof(hash));
+    }
+
+    void HashPlane(int idx)
+    {
+        int bucket = (int)fabsf(planes[idx].d) / 8;
+        bucket &= 1023;
+        planes[idx].hashNext = hash[bucket];
+        hash[bucket] = idx;
+    }
+
+    bool PlaneEqual(int idx, const float n[3], float dist) const
+    {
+        const CodMapPlane& p = planes[idx];
+        return fabs(p.n[0] - n[0]) < 1e-7 && fabs(p.n[1] - n[1]) < 1e-7
+            && fabs(p.n[2] - n[2]) < 1e-7 && fabs(p.d - dist) < 0.001f;
+    }
+
+    int FindExisting(const float n[3], float dist, int limit) const
+    {
+        int hashBase = (int)(fabs((double)dist) / 8.0) & 1023;
+        for (int off = -1; off <= 1; ++off) {
+            int bucket = (hashBase + off) & 1023;
+            for (int p = hash[bucket]; p >= 0; p = planes[p].hashNext) {
+                if (p >= limit)
+                    continue;
+                if (PlaneEqual(p, n, dist))
+                    return p;
+            }
+        }
+        return -1;
+    }
+
+    int Create(const float n[3], float dist, int born)
+    {
+        int idx = (int)planes.size();
+        CodMapPlane a{};
+        CodMapPlane b{};
+        a.n[0] = n[0];
+        a.n[1] = n[1];
+        a.n[2] = n[2];
+        a.d = dist;
+        a.born = born;
+        a.hashNext = -1;
+        b.n[0] = -n[0];
+        b.n[1] = -n[1];
+        b.n[2] = -n[2];
+        b.d = -dist;
+        b.born = born;
+        b.hashNext = -1;
+        int type = 3;
+        if (a.n[0] == 1.f || a.n[0] == -1.f)
+            type = 0;
+        else if (a.n[1] == 1.f || a.n[1] == -1.f)
+            type = 1;
+        else if (a.n[2] == 1.f || a.n[2] == -1.f)
+            type = 2;
+        planes.push_back(a);
+        planes.push_back(b);
+        if (type < 3 && (planes[idx].n[0] < 0.f || planes[idx].n[1] < 0.f || planes[idx].n[2] < 0.f)) {
+            swap(planes[idx], planes[idx + 1]);
+            HashPlane(idx);
+            HashPlane(idx + 1);
+            return idx + 1;
+        }
+        HashPlane(idx);
+        HashPlane(idx + 1);
+        return idx;
+    }
+
+    int Find(float n[3], float dist, int born)
+    {
+        CodSnapPlane(n, &dist);
+        int hashBase = (int)(fabs((double)dist) / 8.0) & 1023;
+        for (int off = -1; off <= 1; ++off) {
+            int bucket = (hashBase + off) & 1023;
+            for (int p = hash[bucket]; p >= 0; p = planes[p].hashNext) {
+                if (PlaneEqual(p, n, dist))
+                    return p;
+            }
+        }
+        return Create(n, dist, born);
+    }
+};
+
+struct CodHit {
+    float err = 0.f;
+    int face[3] = { -1, -1, -1 };
+    int born[3] = { -1, -1, -1 };
+    int which = 0;
+};
+
+float CodWorst(const CodPlanePool& pool, const vector<int>& faces, const vector<int>& nums, CodHit* hit, int* pointCount)
+{
+    int n = (int)nums.size();
+    float worst = 0.f;
+    int points = 0;
+    if (pointCount)
+        *pointCount = 0;
+    vector<float> pl((size_t)n * 4);
+    for (int i = 0; i < n; ++i) {
+        const CodMapPlane& src = pool.planes[nums[i]];
+        pl[(size_t)i * 4 + 0] = src.n[0];
+        pl[(size_t)i * 4 + 1] = src.n[1];
+        pl[(size_t)i * 4 + 2] = src.n[2];
+        pl[(size_t)i * 4 + 3] = src.d;
+    }
+    auto at = [&](int i) -> const float* { return &pl[(size_t)i * 4]; };
+    for (int i = 0; i < n - 2; ++i) {
+        for (int j = i + 1; j < n - 1; ++j) {
+            if (nums[j] == nums[i])
+                continue;
+            for (int k = j + 1; k < n; ++k) {
+                if (nums[k] == nums[j] || nums[k] == nums[i])
+                    continue;
+                float point[3];
+                if (!CodIntersect(at(i), at(j), at(k), point))
+                    continue;
+                CodSnapPoint(at(i), at(j), at(k), point);
+                bool outside = false;
+                for (int t = 0; t < n; ++t) {
+                    if (nums[t] == nums[i] || nums[t] == nums[j] || nums[t] == nums[k])
+                        continue;
+                    if (CodDot(at(t), point) - at(t)[3] > 0.1f) {
+                        outside = true;
+                        break;
+                    }
+                }
+                if (outside)
+                    continue;
+                points++;
+                int ids[3] = { i, j, k };
+                for (int s = 0; s < 3; ++s) {
+                    float err = CodDot(at(ids[s]), point) - at(ids[s])[3];
+                    float tol = 0.1f;
+                    float scaled = fabsf(at(ids[s])[3]) * 0.00001f;
+                    if (scaled > tol)
+                        tol = scaled;
+                    if (!(fabsf(err) < tol) && fabsf(err) > fabsf(worst)) {
+                        worst = err;
+                        if (hit) {
+                            hit->err = err;
+                            hit->which = s;
+                            hit->face[0] = faces[i];
+                            hit->face[1] = faces[j];
+                            hit->face[2] = faces[k];
+                            hit->born[0] = pool.planes[nums[i]].born;
+                            hit->born[1] = pool.planes[nums[j]].born;
+                            hit->born[2] = pool.planes[nums[k]].born;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (pointCount)
+        *pointCount = points;
+    return worst;
+}
+
+bool CodAssign(CodPlanePool& pool, BrushOut& brush, int born, vector<int>& sideFaces, vector<int>& nums, CodHit* hit, float* err)
+{
+    sideFaces.clear();
+    nums.clear();
+    for (int i = 0; i < (int)brush.faces.size(); ++i) {
+        float plane[4];
+        if (!CodFacePlane(brush.faces[i], plane))
+            continue;
+        sideFaces.push_back(i);
+        nums.push_back(pool.Find(plane, plane[3], born));
+    }
+    int points = 0;
+    *err = sideFaces.size() >= 3 ? CodWorst(pool, sideFaces, nums, hit, &points) : 1.f;
+    if (points < 4) {
+        *err = 1.f;
+        return false;
+    }
+    return fabsf(*err) < 0.1f;
+}
+
+bool CodSeparateFace(FaceOut& face, const FaceOut& original, int step, const CodPlanePool& pool, int limit)
+{
+    face = original;
+    float plane[4];
+    if (!CodFacePlane(original, plane))
+        return false;
+    CodSnapPlane(plane, &plane[3]);
+    if (step < 16) {
+        const float shifts[] = {
+            0.002f, -0.002f, 0.004f, -0.004f, 0.008f, -0.008f, 0.016f, -0.016f,
+            0.032f, -0.032f, 0.064f, -0.064f, 0.125f, -0.125f, 0.25f, -0.25f
+        };
+        float delta = shifts[step];
+        for (int i = 0; i < 3; ++i) {
+            face.p[i].x = RoundTripCoord(original.p[i].x + (double)plane[0] * delta);
+            face.p[i].y = RoundTripCoord(original.p[i].y + (double)plane[1] * delta);
+            face.p[i].z = RoundTripCoord(original.p[i].z + (double)plane[2] * delta);
+        }
+    } else {
+        int jog = step - 16;
+        if (jog >= 6)
+            return false;
+        float amount = (jog & 1 ? -1.f : 1.f) * (0.05f * (float)(1 + jog / 2));
+        for (int i = 0; i < 3; ++i) {
+            face.p[i].x = RoundTripCoord(original.p[i].x + (double)plane[0] * amount);
+            face.p[i].y = RoundTripCoord(original.p[i].y + (double)plane[1] * amount);
+            face.p[i].z = RoundTripCoord(original.p[i].z + (double)plane[2] * amount);
+        }
+    }
+    float recovered[4];
+    if (!CodFacePlane(face, recovered)) {
+        face = original;
+        return false;
+    }
+    CodSnapPlane(recovered, &recovered[3]);
+    if (CodDot(recovered, plane) < 0.f || pool.FindExisting(recovered, recovered[3], limit) >= 0) {
+        face = original;
+        return false;
+    }
+    return true;
+}
+
+bool CodShareFace(BrushOut& brush, const vector<FaceOut>& original, int victim, int partner)
+{
+    float victimPlane[4], partnerPlane[4];
+    if (!CodFacePlane(original[victim], victimPlane) || !CodFacePlane(original[partner], partnerPlane))
+        return false;
+    CodSnapPlane(victimPlane, &victimPlane[3]);
+    CodSnapPlane(partnerPlane, &partnerPlane[3]);
+    if (CodDot(victimPlane, partnerPlane) < 0.75f)
+        return false;
+    float p0[3];
+    LoadFacePoint(original[victim].p[0], p0);
+    float gap = fabsf(CodDot(partnerPlane, p0) - partnerPlane[3]);
+    if (gap > 1.f)
+        return false;
+    brush.faces[victim].p[0] = original[partner].p[0];
+    brush.faces[victim].p[1] = original[partner].p[1];
+    brush.faces[victim].p[2] = original[partner].p[2];
+    return true;
+}
+
+void SealParsedPlanes(const vector<BrushOut*>& brushes)
+{
+    CodPlanePool pool;
+    int moved = 0;
+    int left = 0;
+    for (int brushIndex = 0; brushIndex < (int)brushes.size(); ++brushIndex) {
+        BrushOut& brush = *brushes[brushIndex];
+        if (brush.faces.size() < 3) {
+            vector<int> sideFaces, nums;
+            CodHit unused;
+            float err = 0.f;
+            CodAssign(pool, brush, brushIndex, sideFaces, nums, &unused, &err);
+            continue;
+        }
+        int mark = (int)pool.planes.size();
+        int markHash[1024];
+        pool.Save(markHash);
+        vector<int> sideFaces, nums;
+        CodHit hit;
+        float err = 0.f;
+        if (CodAssign(pool, brush, brushIndex, sideFaces, nums, &hit, &err))
+            continue;
+
+        vector<FaceOut> original = brush.faces;
+        vector<int> step(brush.faces.size(), 0);
+        vector<char> shared(brush.faces.size(), 0);
+        bool fixed = false;
+        for (int attempt = 0; attempt < 64; ++attempt) {
+            pool.Restore(mark, markHash);
+            if (CodAssign(pool, brush, brushIndex, sideFaces, nums, &hit, &err)) {
+                fixed = true;
+                break;
+            }
+            int victim = -1;
+            if (hit.which >= 0 && hit.which < 3 && hit.face[hit.which] >= 0
+                && hit.born[hit.which] != brushIndex && !shared[hit.face[hit.which]]
+                && step[hit.face[hit.which]] < 22)
+                victim = hit.face[hit.which];
+            if (victim < 0) {
+                for (int s = 0; s < 3; ++s) {
+                    int face = hit.face[s];
+                    if (face >= 0 && hit.born[s] != brushIndex && !shared[face] && step[face] < 22) {
+                        victim = face;
+                        break;
+                    }
+                }
+            }
+            if (victim < 0 && hit.which >= 0 && hit.which < 3) {
+                int face = hit.face[hit.which];
+                if (face >= 0 && !shared[face] && step[face] < 22)
+                    victim = face;
+            }
+            if (victim < 0)
+                break;
+            pool.Restore(mark, markHash);
+            bool changed = false;
+            if (step[victim] < 22) {
+                int use = step[victim]++;
+                changed = CodSeparateFace(brush.faces[victim], original[victim], use, pool, mark);
+                if (!changed)
+                    continue;
+            }
+            if (!changed && !shared[victim]) {
+                int partner = -1;
+                float bestDot = 0.75f;
+                for (int s = 0; s < 3; ++s) {
+                    int other = hit.face[s];
+                    if (other < 0 || other == victim)
+                        continue;
+                    float a[4], b[4];
+                    if (!CodFacePlane(original[victim], a) || !CodFacePlane(original[other], b))
+                        continue;
+                    float dot = CodDot(a, b);
+                    if (dot > bestDot) {
+                        bestDot = dot;
+                        partner = other;
+                    }
+                }
+                if (partner >= 0 && CodShareFace(brush, original, victim, partner)) {
+                    shared[victim] = 1;
+                    changed = true;
+                }
+            }
+            if (!changed)
+                shared[victim] = 1;
+        }
+        if (!fixed) {
+            brush.faces = original;
+            pool.Restore(mark, markHash);
+            if (!CodAssign(pool, brush, brushIndex, sideFaces, nums, &hit, &err)) {
+                brush.faces.clear();
+                left++;
+                cout << "plane seal dropped brush " << brushIndex << " error " << err << endl;
+            }
+        } else {
+            moved++;
+        }
+    }
+    if (moved || left)
+        cout << "plane seal moved " << moved << " brushes, dropped " << left << endl;
 }
 
 } // namespace
@@ -2658,6 +4247,64 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
             geoEnt[i] = 1;
     }
 
+    if (!bsp.primaryLights.empty()) {
+        unordered_set<string> targetNames;
+        for (const Ent& ent : ents) {
+            string targetname = KeyOf(ent, "targetname");
+            if (!targetname.empty())
+                targetNames.insert(targetname);
+        }
+        int restored = 0;
+        for (int i = 0; i < (int)ents.size(); ++i) {
+            if (!IsLightClass(ClassName(ents[i])))
+                continue;
+            string target = KeyOf(ents[i], "target");
+            if (target.empty() || targetNames.count(target))
+                continue;
+            Vec3 origin = OriginOf(ents[i]);
+            const BspPrimaryLight* light = nullptr;
+            string indexText = KeyOf(ents[i], "pl#");
+            if (!indexText.empty()) {
+                int index = atoi(indexText.c_str());
+                if (index >= 0 && index < (int)bsp.primaryLights.size()) {
+                    const BspPrimaryLight& candidate = bsp.primaryLights[index];
+                    Vec3 delta{ origin.x - candidate.origin[0], origin.y - candidate.origin[1], origin.z - candidate.origin[2] };
+                    if (Len(delta) < 1.0)
+                        light = &candidate;
+                }
+            }
+            if (!light) {
+                for (const BspPrimaryLight& candidate : bsp.primaryLights) {
+                    Vec3 delta{ origin.x - candidate.origin[0], origin.y - candidate.origin[1], origin.z - candidate.origin[2] };
+                    if (Len(delta) < 1.0) {
+                        light = &candidate;
+                        break;
+                    }
+                }
+            }
+            if (!light)
+                continue;
+            Vec3 dir{ light->dir[0], light->dir[1], light->dir[2] };
+            double dirLen = Len(dir);
+            if (dirLen < 1e-8)
+                continue;
+            dir = Mul(dir, 1.0 / dirLen);
+            Vec3 at = Sub(origin, Mul(dir, 128.0));
+            char originText[128];
+            snprintf(originText, sizeof(originText), "%.4f %.4f %.4f", at.x, at.y, at.z);
+            Ent marker;
+            marker.pairs.push_back({ "origin", originText });
+            marker.pairs.push_back({ "targetname", target });
+            marker.pairs.push_back({ "classname", "info_null" });
+            ents.push_back(move(marker));
+            geoEnt.push_back(1);
+            targetNames.insert(target);
+            restored++;
+        }
+        if (restored)
+            cout << "restored " << restored << " primary light targets" << endl;
+    }
+
     vector<Vec3> origins(bsp.models.size(), Vec3{ 0, 0, 0 });
     vector<vector<int>> entModels(ents.size());
     vector<char> claimed(bsp.models.size(), 0);
@@ -2690,12 +4337,15 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
     if (!orphans.empty())
         stats.warning = "unreferenced brush models were merged into the geo map";
 
+    gDropSides = gDropMat = gDropPlane = gDropFaces = gDropSolid = 0;
     vector<ModelGeo> models(bsp.models.size());
     for (int m = 0; m < (int)bsp.models.size(); ++m) {
         cout << "model " << m << "/" << bsp.models.size() << endl;
         models[m] = BuildModel(bsp, m, origins[m], matName, names, caulk,
                                stats.droppedBrushes, stats.meshes, stats.meshVerts, stats.triangleMeshes);
     }
+    cout << "drop reasons sides=" << gDropSides << " mat=" << gDropMat << " plane=" << gDropPlane
+         << " faces=" << gDropFaces << " solid=" << gDropSolid << endl;
 
     ModelGeo world = move(models[0]);
     for (int m : orphans) {
@@ -2711,6 +4361,25 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
     for (int i = 0; i < (int)ents.size(); ++i)
         for (int m : entModels[i])
             stats.entityBrushes += (int)models[m].brushes.size();
+
+    vector<BrushOut*> planeOrder;
+    for (BrushOut& brush : world.brushes)
+        planeOrder.push_back(&brush);
+    for (int i = 0; i < (int)ents.size(); ++i) {
+        if (!geoEnt[i])
+            continue;
+        for (int m : entModels[i])
+            for (BrushOut& brush : models[m].brushes)
+                planeOrder.push_back(&brush);
+    }
+    for (int i = 0; i < (int)ents.size(); ++i) {
+        if (i == worldIndex || geoEnt[i] || DroppedClass(ClassName(ents[i])))
+            continue;
+        for (int m : entModels[i])
+            for (BrushOut& brush : models[m].brushes)
+                planeOrder.push_back(&brush);
+    }
+    SealParsedPlanes(planeOrder);
 
     fs::path dir = exeDir / "export" / bspPath.stem();
     fs::create_directories(dir);

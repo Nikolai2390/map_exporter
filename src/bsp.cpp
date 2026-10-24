@@ -327,6 +327,19 @@ BspFile LoadBsp(const wstring& path)
         }
     }
 
+    if (version >= 17) {
+        if (const Chunk* lights = FindChunk(chunks, kLumpPrimaryLights)) {
+            if (lights->size > 0) {
+                if (lights->size % static_cast<int>(sizeof(BspPrimaryLight)) != 0)
+                    Fail("primary light lump size is not a multiple of 128");
+                const int count = lights->size / static_cast<int>(sizeof(BspPrimaryLight));
+                bsp.primaryLights.resize(static_cast<size_t>(count));
+                reader.ReadExact(bsp.primaryLights.data(), lights->offset,
+                                 static_cast<size_t>(lights->size));
+            }
+        }
+    }
+
     // R_LoadWorldInternal reads LUMP_LIGHTGRIDHEADER only when version > 15.
     if (version > 15) {
         if (const Chunk* grid = FindChunk(chunks, kLumpLightGridHeader)) {

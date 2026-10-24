@@ -21,6 +21,7 @@ enum BspLump : int {
     kLumpModels = 37,
     kLumpEntities = 39,
     kLumpReflectionProbes = 41,
+    kLumpPrimaryLights = 43,
     kLumpLightGridHeader = 44,
     kLumpSimpleTriangles = 47,
     kLumpSimpleDrawVerts = 48,
@@ -31,6 +32,8 @@ static constexpr int kContentsDetail = 0x08000000;
 static constexpr int kContentsNonColliding = 0x00000004;
 static constexpr int kContentsMissileClip = 0x00000080;
 static constexpr int kContentsClipShot = 0x00002000;
+static constexpr unsigned kSurfNodraw = 0x00000080;
+static constexpr unsigned kSurfPortal = 0x80000000;
 static constexpr double kPatchTexScale = 1024.0;
 
 struct BspMaterial {
@@ -94,6 +97,24 @@ struct BspProbe {
     char colorCorrection[64];
 };
 
+struct BspPrimaryLight {
+    unsigned char type;
+    unsigned char canUseShadowMap;
+    unsigned char exponent;
+    unsigned char unused;
+    float color[3];
+    float dir[3];
+    float origin[3];
+    float radius;
+    float cosHalfFovOuter;
+    float cosHalfFovInner;
+    float cosHalfFovExpanded;
+    float rotationLimit;
+    float translationLimit;
+    char defName[64];
+};
+static_assert(sizeof(BspPrimaryLight) == 128, "primary light");
+
 struct BspFile {
     int version = 0;
     vector<BspMaterial> materials;
@@ -108,6 +129,7 @@ struct BspFile {
     vector<BspModel> models;
     string entities;
     vector<BspProbe> probes;
+    vector<BspPrimaryLight> primaryLights;
     bool hasLightGrid = false;
     unsigned short lightGridMins[3] = {};
     unsigned short lightGridMaxs[3] = {};
