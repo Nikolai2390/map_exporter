@@ -14,7 +14,7 @@ target_include_directories(map_exporter PRIVATE src)
 
 if(MSVC)
     target_compile_definitions(map_exporter PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
-    target_compile_options(map_exporter PRIVATE /W3 /EHsc /O2)
+    target_compile_options(map_exporter PRIVATE /W3 /EHsc)
 else()
     target_compile_options(map_exporter PRIVATE -O2 -Wall)
 endif()
