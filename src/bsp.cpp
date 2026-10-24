@@ -294,6 +294,7 @@ BspFile LoadBsp(const wstring& path)
     bsp.indices[0] = ReadArray<unsigned short>(reader, chunks, kLumpDrawIndices);
     bsp.indices[1] = ReadArray<unsigned short>(reader, chunks, kLumpSimpleDrawIndices);
     bsp.models = ReadArray<BspModel>(reader, chunks, kLumpModels);
+    bsp.collisionAabbs = ReadArray<BspCollisionAabb>(reader, chunks, kLumpCollisionAabbs);
 
     if (const Chunk* ents = FindChunk(chunks, kLumpEntities)) {
         if (ents->size > 0) {

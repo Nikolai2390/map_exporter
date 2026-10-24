@@ -18,6 +18,7 @@ enum BspLump : int {
     kLumpTriangles = 9,
     kLumpDrawVerts = 10,
     kLumpDrawIndices = 11,
+    kLumpCollisionAabbs = 36,
     kLumpModels = 37,
     kLumpEntities = 39,
     kLumpReflectionProbes = 41,
@@ -92,6 +93,15 @@ struct BspModel {
     int numBrushes;
 };
 
+struct BspCollisionAabb {
+    float midPoint[3];
+    float halfSize[3];
+    unsigned short materialIndex;
+    unsigned short childCount;
+    int u;
+};
+static_assert(sizeof(BspCollisionAabb) == 32, "collision aabb");
+
 struct BspProbe {
     float origin[3];
     char colorCorrection[64];
@@ -127,6 +137,7 @@ struct BspFile {
     vector<BspDrawVert> verts[2];
     vector<unsigned short> indices[2];
     vector<BspModel> models;
+    vector<BspCollisionAabb> collisionAabbs;
     string entities;
     vector<BspProbe> probes;
     vector<BspPrimaryLight> primaryLights;

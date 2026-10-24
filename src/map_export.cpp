@@ -1698,6 +1698,18 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
         }
     } else {
         brush.contents &= ~(unsigned)kContentsDetail;
+        int portalNodraw = caulk;
+        auto pn = names.lookup.find("portal_nodraw");
+        if (pn != names.lookup.end())
+            portalNodraw = pn->second;
+        const string& portalNodrawName = names.list[portalNodraw];
+        for (size_t i = 0; i < brush.faces.size(); ++i) {
+            if (IsPortalMapMaterial(sides.sides[i].surfaceFlags, brush.faces[i].material))
+                continue;
+            brush.faces[i].material = portalNodrawName;
+            sides.sides[i].nameId = portalNodraw;
+            sides.sides[i].surfaceFlags = kSurfNodraw;
+        }
     }
 
     if (brush.faces.size() >= 4 && brush.faces.size() == sides.sides.size()) {
@@ -3137,6 +3149,108 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
                 surface.push_back(bucket.second[i]);
         BuildMeshes(weld, surface, bucket.first.contents, material, geo.meshes, meshCount, vertCount, triMeshes);
     }
+
+    if (geo.brushes.empty() && geo.meshes.empty() && model.numSurfaces > 0) {
+        if (model.firstSurface < 0
+            || model.firstSurface + model.numSurfaces > (int)bsp.collisionAabbs.size())
+            throw runtime_error("model collision aabb range is outside the bsp");
+
+        vector<int> queue;
+        for (int i = 0; i < model.numSurfaces; ++i)
+            queue.push_back(model.firstSurface + i);
+        for (size_t qi = 0; qi < queue.size(); ++qi) {
+            int index = queue[qi];
+            if (index < 0 || index >= (int)bsp.collisionAabbs.size())
+                continue;
+            const BspCollisionAabb& aabb = bsp.collisionAabbs[index];
+            if (aabb.childCount > 0) {
+                for (int c = 0; c < (int)aabb.childCount; ++c)
+                    queue.push_back(aabb.u + c);
+                continue;
+            }
+
+            string material = "caulk";
+            unsigned contents = 0;
+            if (aabb.materialIndex < bsp.materials.size()) {
+                material = ResolveLayered(MaterialName(bsp.materials[aabb.materialIndex]), bsp);
+                contents = bsp.materials[aabb.materialIndex].contentFlags;
+            }
+
+            double x0 = (double)aabb.midPoint[0] - (double)aabb.halfSize[0] + origin.x;
+            double y0 = (double)aabb.midPoint[1] - (double)aabb.halfSize[1] + origin.y;
+            double z0 = (double)aabb.midPoint[2] - (double)aabb.halfSize[2] + origin.z;
+            double x1 = (double)aabb.midPoint[0] + (double)aabb.halfSize[0] + origin.x;
+            double y1 = (double)aabb.midPoint[1] + (double)aabb.halfSize[1] + origin.y;
+            double z1 = (double)aabb.midPoint[2] + (double)aabb.halfSize[2] + origin.z;
+
+            const double eps = 1e-3;
+            int flat = -1;
+            if (fabs(x1 - x0) < eps)
+                flat = 0;
+            else if (fabs(y1 - y0) < eps)
+                flat = 1;
+            else if (fabs(z1 - z0) < eps)
+                flat = 2;
+
+            if (flat >= 0) {
+                MeshOut mesh;
+                mesh.contents = contents;
+                mesh.material = material;
+                mesh.width = 2;
+                mesh.height = 2;
+                mesh.verts.resize(4);
+                auto setV = [&](int vi, double x, double y, double z) {
+                    mesh.verts[vi].p = { x, y, z };
+                    mesh.verts[vi].st[0] = 0;
+                    mesh.verts[vi].st[1] = 0;
+                    mesh.verts[vi].lm[0] = 0;
+                    mesh.verts[vi].lm[1] = 0;
+                    mesh.verts[vi].n[0] = flat == 0 ? 1.f : 0.f;
+                    mesh.verts[vi].n[1] = flat == 1 ? 1.f : 0.f;
+                    mesh.verts[vi].n[2] = flat == 2 ? 1.f : 0.f;
+                    mesh.verts[vi].color[0] = mesh.verts[vi].color[1] = mesh.verts[vi].color[2] = 255;
+                    mesh.verts[vi].color[3] = 255;
+                };
+                if (flat == 0) {
+                    setV(0, x0, y0, z0);
+                    setV(1, x0, y0, z1);
+                    setV(2, x0, y1, z0);
+                    setV(3, x0, y1, z1);
+                } else if (flat == 1) {
+                    setV(0, x0, y0, z0);
+                    setV(1, x0, y0, z1);
+                    setV(2, x1, y0, z0);
+                    setV(3, x1, y0, z1);
+                } else {
+                    setV(0, x0, y0, z0);
+                    setV(1, x0, y1, z0);
+                    setV(2, x1, y0, z0);
+                    setV(3, x1, y1, z0);
+                }
+                PushPieces(geo.meshes, move(mesh), meshCount, vertCount);
+                ++triMeshes;
+            } else {
+                BrushOut brush;
+                brush.contents = contents;
+                auto add = [&](double ax, double ay, double az, double bx, double by, double bz,
+                               double cx, double cy, double cz) {
+                    FaceOut face;
+                    face.material = material;
+                    face.p[0] = { ax, ay, az };
+                    face.p[1] = { bx, by, bz };
+                    face.p[2] = { cx, cy, cz };
+                    brush.faces.push_back(face);
+                };
+                add(x1, y1, z0, x0, y1, z0, x0, y0, z0);
+                add(x0, y0, z1, x0, y1, z1, x1, y1, z1);
+                add(x1, y0, z0, x0, y0, z0, x0, y0, z1);
+                add(x0, y1, z0, x1, y1, z0, x1, y1, z1);
+                add(x0, y0, z0, x0, y1, z0, x0, y1, z1);
+                add(x1, y1, z0, x1, y0, z0, x1, y0, z1);
+                geo.brushes.push_back(move(brush));
+            }
+        }
+    }
     return geo;
 }
 
@@ -3396,15 +3510,26 @@ string KeyOf(const Ent& ent, const string& key)
     return {};
 }
 
-int StarModel(const string& value)
+void SetKey(Ent& ent, const string& key, const string& value)
 {
-    if (value.size() < 2 || value[0] != '*')
+    for (Pair& pair : ent.pairs) {
+        if (pair.key == key) {
+            pair.value = value;
+            return;
+        }
+    }
+    ent.pairs.push_back({ key, value });
+}
+
+int FindEntWithTargetname(const vector<Ent>& ents, const string& name)
+{
+    if (name.empty())
         return -1;
-    char* end = nullptr;
-    long n = strtol(value.c_str() + 1, &end, 10);
-    if (!end || *end || n < 0 || n > 1000000)
-        return -1;
-    return (int)n;
+    for (int i = 0; i < (int)ents.size(); ++i) {
+        if (KeyOf(ents[i], "targetname") == name)
+            return i;
+    }
+    return -1;
 }
 
 Vec3 OriginOf(const Ent& ent)
@@ -3415,6 +3540,40 @@ Vec3 OriginOf(const Ent& ent)
         return origin;
     sscanf(value.c_str(), "%lf %lf %lf", &origin.x, &origin.y, &origin.z);
     return origin;
+}
+
+const BspPrimaryLight* MatchPrimaryLight(const BspFile& bsp, const Ent& ent)
+{
+    Vec3 origin = OriginOf(ent);
+    string indexText = KeyOf(ent, "pl#");
+    if (!indexText.empty()) {
+        int index = atoi(indexText.c_str());
+        if (index >= 0 && index < (int)bsp.primaryLights.size()) {
+            const BspPrimaryLight& candidate = bsp.primaryLights[index];
+            Vec3 delta{ origin.x - candidate.origin[0], origin.y - candidate.origin[1],
+                        origin.z - candidate.origin[2] };
+            if (Len(delta) < 1.0)
+                return &candidate;
+        }
+    }
+    for (const BspPrimaryLight& candidate : bsp.primaryLights) {
+        Vec3 delta{ origin.x - candidate.origin[0], origin.y - candidate.origin[1],
+                    origin.z - candidate.origin[2] };
+        if (Len(delta) < 1.0)
+            return &candidate;
+    }
+    return nullptr;
+}
+
+int StarModel(const string& value)
+{
+    if (value.size() < 2 || value[0] != '*')
+        return -1;
+    char* end = nullptr;
+    long n = strtol(value.c_str() + 1, &end, 10);
+    if (!end || *end || n < 0 || n > 1000000)
+        return -1;
+    return (int)n;
 }
 
 bool IsLightClass(const string& name)
@@ -4247,7 +4406,7 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
             geoEnt[i] = 1;
     }
 
-    if (!bsp.primaryLights.empty()) {
+    {
         unordered_set<string> targetNames;
         for (const Ent& ent : ents) {
             string targetname = KeyOf(ent, "targetname");
@@ -4255,41 +4414,47 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
                 targetNames.insert(targetname);
         }
         int restored = 0;
-        for (int i = 0; i < (int)ents.size(); ++i) {
+        const int lightCount = (int)ents.size();
+        for (int i = 0; i < lightCount; ++i) {
             if (!IsLightClass(ClassName(ents[i])))
                 continue;
+
             string target = KeyOf(ents[i], "target");
+            if (target.empty())
+                continue;
+
+            int targetIdx = FindEntWithTargetname(ents, target);
+            if (targetIdx >= 0 && IsLightTargetClass(ClassName(ents[targetIdx])))
+                continue;
+
+            const BspPrimaryLight* light = MatchPrimaryLight(bsp, ents[i]);
+            Vec3 at{ 0, 0, 0 };
+            if (targetIdx >= 0 && !IsLightTargetClass(ClassName(ents[targetIdx]))) {
+                if (!light)
+                    continue;
+                at = OriginOf(ents[targetIdx]);
+                string unique = target + "_aim";
+                while (targetNames.count(unique))
+                    unique += "_";
+                SetKey(ents[i], "target", unique);
+                target = unique;
+            } else if (targetIdx < 0) {
+                if (!light)
+                    continue;
+                Vec3 origin = OriginOf(ents[i]);
+                Vec3 dir{ light->dir[0], light->dir[1], light->dir[2] };
+                double dirLen = Len(dir);
+                if (dirLen < 1e-8)
+                    continue;
+                dir = Mul(dir, 1.0 / dirLen);
+                at = Sub(origin, Mul(dir, 128.0));
+            } else {
+                continue;
+            }
+
             if (target.empty() || targetNames.count(target))
                 continue;
-            Vec3 origin = OriginOf(ents[i]);
-            const BspPrimaryLight* light = nullptr;
-            string indexText = KeyOf(ents[i], "pl#");
-            if (!indexText.empty()) {
-                int index = atoi(indexText.c_str());
-                if (index >= 0 && index < (int)bsp.primaryLights.size()) {
-                    const BspPrimaryLight& candidate = bsp.primaryLights[index];
-                    Vec3 delta{ origin.x - candidate.origin[0], origin.y - candidate.origin[1], origin.z - candidate.origin[2] };
-                    if (Len(delta) < 1.0)
-                        light = &candidate;
-                }
-            }
-            if (!light) {
-                for (const BspPrimaryLight& candidate : bsp.primaryLights) {
-                    Vec3 delta{ origin.x - candidate.origin[0], origin.y - candidate.origin[1], origin.z - candidate.origin[2] };
-                    if (Len(delta) < 1.0) {
-                        light = &candidate;
-                        break;
-                    }
-                }
-            }
-            if (!light)
-                continue;
-            Vec3 dir{ light->dir[0], light->dir[1], light->dir[2] };
-            double dirLen = Len(dir);
-            if (dirLen < 1e-8)
-                continue;
-            dir = Mul(dir, 1.0 / dirLen);
-            Vec3 at = Sub(origin, Mul(dir, 128.0));
+
             char originText[128];
             snprintf(originText, sizeof(originText), "%.4f %.4f %.4f", at.x, at.y, at.z);
             Ent marker;
@@ -4299,10 +4464,11 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
             ents.push_back(move(marker));
             geoEnt.push_back(1);
             targetNames.insert(target);
+            lightTargets.insert(target);
             restored++;
         }
         if (restored)
-            cout << "restored " << restored << " primary light targets" << endl;
+            cout << "restored " << restored << " light targets" << endl;
     }
 
     vector<Vec3> origins(bsp.models.size(), Vec3{ 0, 0, 0 });
