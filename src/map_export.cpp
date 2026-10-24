@@ -1,0 +1,2777 @@
+#include "map_export.hpp"
+#include "bsp.hpp"
+
+#include <cctype>
+#include <cstdlib>
+
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kOnPlane = 0.2;
+constexpr double kInsideSlop = 1.0;
+// Radiant's patchMesh_t::ctrl is [16][16]. A wider or taller mesh writes off the end and crashes on load.
+constexpr int kMaxPatch = 16;
+
+struct Vec3 {
+    double x, y, z;
+};
+
+struct PlaneD {
+    double n[3];
+    double dist;
+    double Dist(const Vec3& p) const
+    {
+        return n[0] * p.x + n[1] * p.y + n[2] * p.z - dist;
+    }
+};
+
+struct FaceOut {
+    Vec3 p[3];
+    string material;
+    double scaleS = 64, scaleT = 64;
+    double shiftS = 0, shiftT = 0;
+    double rotate = 0, skew = 0;
+};
+
+struct BrushOut {
+    unsigned contents = 0;
+    vector<FaceOut> faces;
+};
+
+struct MeshVertOut {
+    Vec3 p;
+    float st[2];
+    float lm[2];
+    float n[3];
+    unsigned char color[4];
+    int flag = 0;
+};
+
+struct MeshOut {
+    unsigned contents = 0;
+    string material;
+    int width = 0;
+    int height = 0;
+    vector<MeshVertOut> verts;
+};
+
+struct ModelGeo {
+    vector<BrushOut> brushes;
+    vector<MeshOut> meshes;
+};
+
+struct Pair {
+    string key;
+    string value;
+};
+
+struct Ent {
+    vector<Pair> pairs;
+};
+
+struct WeldVert {
+    Vec3 p;
+    float st[2];
+    float lm[2];
+    float n[3];
+    unsigned char color[4];
+};
+
+struct Tri {
+    int a, b, c;
+};
+
+struct Quad {
+    int v[4];
+    int tri[2];
+};
+
+struct SideGeom {
+    int nameId = 0;
+    PlaneD plane;
+    double mins[3];
+    double maxs[3];
+    vector<Vec3> winding;
+    int faceIndex = -1;
+};
+
+Vec3 Add(const Vec3& a, const Vec3& b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+Vec3 Sub(const Vec3& a, const Vec3& b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+Vec3 Mul(const Vec3& a, double s) { return { a.x * s, a.y * s, a.z * s }; }
+double Dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 Cross(const Vec3& a, const Vec3& b)
+{
+    return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+}
+double Len(const Vec3& a) { return sqrt(Dot(a, a)); }
+
+Vec3 FromVert(const BspDrawVert& v, const Vec3& origin)
+{
+    return { v.xyz[0] + origin.x, v.xyz[1] + origin.y, v.xyz[2] + origin.z };
+}
+
+double SnapNear(double v)
+{
+    double rounded = round(v);
+    if (fabs(v - rounded) < 0.001)
+        return rounded;
+    return v;
+}
+
+void WriteNum(FILE* f, double v)
+{
+    if (!isfinite(v))
+        v = 0;
+    double rounded = round(v);
+    if (fabs(v - rounded) < 1e-4) {
+        fprintf(f, "%.0f", rounded);
+        return;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.6f", v);
+    char* end = buf + strlen(buf);
+    while (end > buf && end[-1] == '0')
+        --end;
+    if (end > buf && end[-1] == '.')
+        --end;
+    *end = 0;
+    fputs(buf, f);
+}
+
+const char* ContentsToken(unsigned flags)
+{
+    const unsigned weapon = (unsigned)kContentsDetail | (unsigned)kContentsClipShot | (unsigned)kContentsMissileClip;
+    if ((flags & weapon) == weapon)
+        return "weaponClip";
+    if (flags & (unsigned)kContentsNonColliding)
+        return "nonColliding";
+    if (flags & (unsigned)kContentsDetail)
+        return "detail";
+    return nullptr;
+}
+
+vector<Vec3> BaseWinding(const PlaneD& plane)
+{
+    double ax = fabs(plane.n[0]);
+    double ay = fabs(plane.n[1]);
+    double az = fabs(plane.n[2]);
+    Vec3 up;
+    if (ax <= ay && ax <= az)
+        up = { 1, 0, 0 };
+    else if (ay <= ax && ay <= az)
+        up = { 0, 1, 0 };
+    else
+        up = { 0, 0, 1 };
+
+    Vec3 n = { plane.n[0], plane.n[1], plane.n[2] };
+    Vec3 right = Cross(up, n);
+    double rightLen = Len(right);
+    if (rightLen < 1e-12)
+        return {};
+    right = Mul(right, 1.0 / rightLen);
+    up = Cross(n, right);
+
+    Vec3 org = Mul(n, plane.dist);
+    const double bound = 8.0e6;
+    vector<Vec3> w(4);
+    w[0] = Add(org, Add(Mul(up, bound), Mul(right, -bound)));
+    w[1] = Add(org, Add(Mul(up, bound), Mul(right, bound)));
+    w[2] = Add(org, Add(Mul(up, -bound), Mul(right, bound)));
+    w[3] = Add(org, Add(Mul(up, -bound), Mul(right, -bound)));
+
+    Vec3 facing = Cross(Sub(w[1], w[0]), Sub(w[2], w[0]));
+    if (Dot(facing, n) < 0)
+        reverse(w.begin(), w.end());
+    return w;
+}
+
+vector<Vec3> ClipWinding(const vector<Vec3>& in, const PlaneD& plane)
+{
+    vector<Vec3> out;
+    if (in.empty())
+        return out;
+    const double eps = 0.05;
+    for (size_t i = 0; i < in.size(); ++i) {
+        const Vec3& a = in[i];
+        const Vec3& b = in[(i + 1) % in.size()];
+        double da = plane.Dist(a);
+        double db = plane.Dist(b);
+        if (da <= eps)
+            out.push_back(a);
+        if ((da > eps && db < -eps) || (da < -eps && db > eps)) {
+            double t = da / (da - db);
+            out.push_back({ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t });
+        }
+    }
+    return out;
+}
+
+bool BestTriangle(const vector<Vec3>& w, Vec3 out[3])
+{
+    double best = 0.01;
+    bool found = false;
+    if (w.size() < 3)
+        return false;
+    for (size_t i = 0; i < w.size(); ++i) {
+        Vec3 a = w[i];
+        Vec3 b = w[(i + 1) % w.size()];
+        Vec3 c = w[(i + 2) % w.size()];
+        double area = Len(Cross(Sub(b, a), Sub(c, a)));
+        if (area > best) {
+            best = area;
+            out[0] = a;
+            out[1] = b;
+            out[2] = c;
+            found = true;
+        }
+    }
+    return found;
+}
+
+Vec3 PlaneFromPointsNormal(const Vec3& p0, const Vec3& p1, const Vec3& p2)
+{
+    return Cross(Sub(p2, p0), Sub(p1, p0));
+}
+
+bool FacePoints(const vector<Vec3>& winding, const PlaneD& plane, Vec3 out[3])
+{
+    if (!BestTriangle(winding, out))
+        return false;
+    Vec3 n = { plane.n[0], plane.n[1], plane.n[2] };
+    if (Dot(PlaneFromPointsNormal(out[0], out[1], out[2]), n) < 0.0) {
+        Vec3 mid = out[1];
+        out[1] = out[2];
+        out[2] = mid;
+    }
+    return Dot(PlaneFromPointsNormal(out[0], out[1], out[2]), n) > 0.0;
+}
+
+void OrientWinding(vector<Vec3>& winding, const PlaneD& plane)
+{
+    if (winding.size() < 3)
+        return;
+    Vec3 n = { plane.n[0], plane.n[1], plane.n[2] };
+    Vec3 area{ 0, 0, 0 };
+    for (size_t i = 1; i + 1 < winding.size(); ++i)
+        area = Add(area, Cross(Sub(winding[i], winding[0]), Sub(winding[i + 1], winding[0])));
+    if (Dot(area, n) < 0.0)
+        reverse(winding.begin(), winding.end());
+}
+
+double MinorSpan(const vector<Vec3>& winding, const PlaneD& plane)
+{
+    if (winding.size() < 3)
+        return 0;
+    Vec3 n = { plane.n[0], plane.n[1], plane.n[2] };
+    Vec3 axis = fabs(n.z) < 0.9 ? Vec3{ 0, 0, 1 } : Vec3{ 1, 0, 0 };
+    Vec3 tangent = Cross(n, axis);
+    double tlen = Len(tangent);
+    if (tlen < 1e-8)
+        return 0;
+    tangent = Mul(tangent, 1.0 / tlen);
+    Vec3 bitangent = Cross(n, tangent);
+    double minU = 1e30, maxU = -1e30, minV = 1e30, maxV = -1e30;
+    for (const Vec3& p : winding) {
+        double u = Dot(p, tangent);
+        double v = Dot(p, bitangent);
+        minU = min(minU, u);
+        maxU = max(maxU, u);
+        minV = min(minV, v);
+        maxV = max(maxV, v);
+    }
+    return min(maxU - minU, maxV - minV);
+}
+
+bool Solve3(const double m[3][3], const double b[3], double x[3]);
+
+bool IntersectPlanes(const PlaneD& a, const PlaneD& b, const PlaneD& c, Vec3& out)
+{
+    double m[3][3] = {
+        { a.n[0], a.n[1], a.n[2] },
+        { b.n[0], b.n[1], b.n[2] },
+        { c.n[0], c.n[1], c.n[2] }
+    };
+    double rhs[3] = { a.dist, b.dist, c.dist };
+    double x[3];
+    if (!Solve3(m, rhs, x))
+        return false;
+    out = { x[0], x[1], x[2] };
+    return true;
+}
+
+bool InsideConvex(const vector<Vec3>& w, const Vec3& p, const Vec3& n, double slop)
+{
+    if (w.size() < 3)
+        return false;
+    for (size_t i = 0; i < w.size(); ++i) {
+        Vec3 edge = Sub(w[(i + 1) % w.size()], w[i]);
+        double edgeLen = Len(edge);
+        if (edgeLen < 1e-8)
+            continue;
+        double side = Dot(Cross(edge, Sub(p, w[i])), n);
+        if (side < -slop * edgeLen)
+            return false;
+    }
+    return true;
+}
+
+void BoundsOf(const vector<Vec3>& w, double mins[3], double maxs[3])
+{
+    mins[0] = maxs[0] = w[0].x;
+    mins[1] = maxs[1] = w[0].y;
+    mins[2] = maxs[2] = w[0].z;
+    for (const Vec3& p : w) {
+        mins[0] = min(mins[0], p.x); maxs[0] = max(maxs[0], p.x);
+        mins[1] = min(mins[1], p.y); maxs[1] = max(maxs[1], p.y);
+        mins[2] = min(mins[2], p.z); maxs[2] = max(maxs[2], p.z);
+    }
+}
+
+bool BoundsOverlap(const double mins[3], const double maxs[3], const Vec3& a, const Vec3& b, const Vec3& c, double pad)
+{
+    double tmin[3] = { min(a.x, min(b.x, c.x)) - pad, min(a.y, min(b.y, c.y)) - pad, min(a.z, min(b.z, c.z)) - pad };
+    double tmax[3] = { max(a.x, max(b.x, c.x)) + pad, max(a.y, max(b.y, c.y)) + pad, max(a.z, max(b.z, c.z)) + pad };
+    for (int i = 0; i < 3; ++i) {
+        if (tmax[i] < mins[i] || tmin[i] > maxs[i])
+            return false;
+    }
+    return true;
+}
+
+void TextureAxes(const double n[3], double xv[3], double yv[3], int& s, int& t)
+{
+    static const double table[6][3][3] = {
+        { { 0, 0, 1 }, { 1, 0, 0 }, { 0, -1, 0 } },
+        { { 0, 0, -1 }, { 1, 0, 0 }, { 0, -1, 0 } },
+        { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, -1 } },
+        { { -1, 0, 0 }, { 0, 1, 0 }, { 0, 0, -1 } },
+        { { 0, 1, 0 }, { 1, 0, 0 }, { 0, 0, -1 } },
+        { { 0, -1, 0 }, { 1, 0, 0 }, { 0, 0, -1 } }
+    };
+    int best = 0;
+    double bestDot = -1e30;
+    for (int i = 0; i < 6; ++i) {
+        double d = n[0] * table[i][0][0] + n[1] * table[i][0][1] + n[2] * table[i][0][2];
+        if (d > bestDot) {
+            bestDot = d;
+            best = i;
+        }
+    }
+    memcpy(xv, table[best][1], sizeof(double) * 3);
+    memcpy(yv, table[best][2], sizeof(double) * 3);
+    auto axisOf = [](const double v[3]) {
+        if (v[0] != 0.0) return 0;
+        if (v[1] != 0.0) return 1;
+        return 2;
+    };
+    s = axisOf(xv);
+    t = axisOf(yv);
+}
+
+double Det3(const double m[3][3])
+{
+    return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+}
+
+bool Solve3(const double m[3][3], const double b[3], double x[3])
+{
+    double det = Det3(m);
+    if (fabs(det) < 1e-12)
+        return false;
+    for (int col = 0; col < 3; ++col) {
+        double copy[3][3];
+        memcpy(copy, m, sizeof(copy));
+        for (int row = 0; row < 3; ++row)
+            copy[row][col] = b[row];
+        x[col] = Det3(copy) / det;
+    }
+    return true;
+}
+
+bool ExtractTex(const double planeN[3], double planeDist, double tex[2][4],
+                const double xv[3], const double yv[3], int s, int t, FaceOut& face)
+{
+    int r = 3 - s - t;
+    if (fabs(planeN[r]) > 1e-8) {
+        for (int i = 0; i < 2; ++i) {
+            if (tex[i][r] == 0.0)
+                continue;
+            double d = tex[i][r] / planeN[r];
+            tex[i][0] -= d * planeN[0];
+            tex[i][1] -= d * planeN[1];
+            tex[i][2] -= d * planeN[2];
+            tex[i][3] += planeDist * d;
+        }
+    }
+
+    double lenT2 = tex[1][0] * tex[1][0] + tex[1][1] * tex[1][1] + tex[1][2] * tex[1][2];
+    if (lenT2 < 1e-18)
+        return false;
+    double skew = (tex[0][0] * tex[1][0] + tex[0][1] * tex[1][1] + tex[0][2] * tex[1][2]) / lenT2;
+    tex[0][0] -= skew * tex[1][0];
+    tex[0][1] -= skew * tex[1][1];
+    tex[0][2] -= skew * tex[1][2];
+
+    double lenS = sqrt(tex[0][0] * tex[0][0] + tex[0][1] * tex[0][1] + tex[0][2] * tex[0][2]);
+    double lenT = sqrt(lenT2);
+    if (lenS < 1e-12 || lenT < 1e-12)
+        return false;
+
+    double scaleS = 1.0 / lenS;
+    double scaleT = 1.0 / lenT;
+    double p0s = xv[s];
+    double p1t = yv[t];
+    if (tex[0][s] * p0s * tex[1][t] * p1t - tex[0][t] * p0s * tex[1][s] * p1t < 0.0)
+        scaleT = -scaleT;
+
+    double rotate = atan2(tex[0][t] * p0s, tex[0][s] * p0s) * (180.0 / kPi);
+    double shiftS = -tex[0][3] * scaleS;
+    double shiftT = -tex[1][3] * scaleT;
+    if (!isfinite(scaleS) || !isfinite(scaleT) || fabs(scaleS) < 0.01 || fabs(scaleT) < 0.01
+        || fabs(scaleS) > 1.0e6 || fabs(scaleT) > 1.0e6)
+        return false;
+
+    face.scaleS = SnapNear(scaleS);
+    face.scaleT = SnapNear(scaleT);
+    face.shiftS = SnapNear(shiftS);
+    face.shiftT = SnapNear(shiftT);
+    face.rotate = SnapNear(rotate);
+    face.skew = SnapNear(skew);
+    return true;
+}
+
+struct Hit {
+    double x, y, z, s, t;
+};
+
+bool FitFace(const vector<Hit>& hits, const PlaneD& plane, FaceOut& face)
+{
+    if (hits.size() < 3)
+        return false;
+
+    int axisDrop = 0;
+    if (fabs(plane.n[0]) < fabs(plane.n[1]))
+        axisDrop = 1;
+    if (fabs(plane.n[axisDrop]) < fabs(plane.n[2]))
+        axisDrop = 2;
+    int axisU = (~axisDrop) & 1;
+    int axisV = (~axisDrop) & 2;
+
+    double m[3][3];
+    double sVal[3];
+    double tVal[3];
+    for (int i = 0; i < 3; ++i) {
+        double xyz[3] = { hits[i].x, hits[i].y, hits[i].z };
+        m[i][0] = xyz[axisU];
+        m[i][1] = xyz[axisV];
+        m[i][2] = 1.0;
+        sVal[i] = hits[i].s;
+        tVal[i] = hits[i].t;
+    }
+
+    double tex[2][4] = {};
+    auto solveChannel = [&](const double val[3], int channel) -> bool {
+        if (val[0] == val[1] && val[1] == val[2]) {
+            tex[channel][3] = val[0];
+            return true;
+        }
+        double sol[3];
+        if (!Solve3(m, val, sol))
+            return false;
+        tex[channel][axisU] = sol[0];
+        tex[channel][axisV] = sol[1];
+        tex[channel][axisDrop] = 0.0;
+        tex[channel][3] = sol[2];
+        return true;
+    };
+    if (!solveChannel(sVal, 0) || !solveChannel(tVal, 1))
+        return false;
+
+    double xv[3], yv[3];
+    int s = 0, t = 0;
+    TextureAxes(plane.n, xv, yv, s, t);
+    return ExtractTex(plane.n, plane.dist, tex, xv, yv, s, t, face);
+}
+
+bool MakePlane(const BspFile& bsp, const BspBrushSide& side, int local, const Vec3& origin, PlaneD& out)
+{
+    double n[3] = {};
+    double dist = 0;
+    if (local < 6) {
+        int axis = local >> 1;
+        float stored = 0;
+        memcpy(&stored, &side.planeOrDist, sizeof(stored));
+        if (local & 1) {
+            n[axis] = 1.0;
+            dist = stored;
+        } else {
+            n[axis] = -1.0;
+            dist = -(double)stored;
+        }
+    } else {
+        int planeNum = (int)side.planeOrDist;
+        if (planeNum < 0 || planeNum >= (int)bsp.planes.size())
+            return false;
+        const BspPlane& src = bsp.planes[planeNum];
+        double len = sqrt((double)src.normal[0] * src.normal[0]
+                         + (double)src.normal[1] * src.normal[1]
+                         + (double)src.normal[2] * src.normal[2]);
+        if (len < 1e-8)
+            return false;
+        n[0] = src.normal[0] / len;
+        n[1] = src.normal[1] / len;
+        n[2] = src.normal[2] / len;
+        dist = src.dist / len;
+    }
+    dist += n[0] * origin.x + n[1] * origin.y + n[2] * origin.z;
+    out.n[0] = n[0];
+    out.n[1] = n[1];
+    out.n[2] = n[2];
+    out.dist = dist;
+    return true;
+}
+
+struct Names {
+    vector<string> list;
+    unordered_map<string, int> lookup;
+    int Intern(const string& name)
+    {
+        auto found = lookup.find(name);
+        if (found != lookup.end())
+            return found->second;
+        int id = (int)list.size();
+        list.push_back(name);
+        lookup.emplace(name, id);
+        return id;
+    }
+};
+
+struct BuiltSides {
+    vector<SideGeom> sides;
+};
+
+bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& origin,
+                const vector<int>& matName, const Names& names, int caulk,
+                const vector<int>& edgeStart, BrushOut& brush, BuiltSides& sides)
+{
+    const BspBrush& src = bsp.brushes[brushIndex];
+    if (src.numSides < 4)
+        return false;
+    if (src.materialNum >= bsp.materials.size())
+        return false;
+
+    vector<PlaneD> planes(src.numSides);
+    for (int local = 0; local < src.numSides; ++local) {
+        if (!MakePlane(bsp, bsp.sides[sideStart + local], local, origin, planes[local]))
+            return false;
+    }
+
+    brush.contents = bsp.materials[src.materialNum].contentFlags;
+    brush.faces.clear();
+
+    for (int local = 0; local < src.numSides; ++local) {
+        vector<Vec3> winding;
+        bool fromEdges = false;
+        int sideIndex = sideStart + local;
+        int e0 = (sideIndex < (int)edgeStart.size()) ? edgeStart[sideIndex] : 0;
+        int e1 = (sideIndex + 1 < (int)edgeStart.size()) ? edgeStart[sideIndex + 1] : e0;
+        if (e1 - e0 >= 3 && e1 <= (int)bsp.edges.size()) {
+            fromEdges = true;
+            for (int e = 0; e < e1 - e0; ++e) {
+                int s0 = bsp.edges[e0 + e];
+                int s1 = bsp.edges[e0 + ((e + 1) % (e1 - e0))];
+                Vec3 point;
+                if (s0 >= src.numSides || s1 >= src.numSides || s0 == local || s1 == local
+                    || !IntersectPlanes(planes[local], planes[s0], planes[s1], point)) {
+                    fromEdges = false;
+                    break;
+                }
+                winding.push_back(point);
+            }
+        }
+        if (!fromEdges || winding.size() < 3) {
+            winding = BaseWinding(planes[local]);
+            for (int other = 0; other < src.numSides && !winding.empty(); ++other) {
+                if (other == local)
+                    continue;
+                winding = ClipWinding(winding, planes[other]);
+            }
+        }
+        OrientWinding(winding, planes[local]);
+        Vec3 tri[3];
+        if (!FacePoints(winding, planes[local], tri))
+            continue;
+
+        FaceOut face;
+        face.p[0] = tri[0];
+        face.p[1] = tri[1];
+        face.p[2] = tri[2];
+        unsigned matNum = bsp.sides[sideStart + local].materialNum;
+        int nameId = caulk;
+        if (matNum < bsp.materials.size())
+            nameId = matName[matNum];
+        if (nameId < 0 || nameId >= (int)names.list.size())
+            nameId = caulk;
+        face.material = names.list[nameId];
+        brush.faces.push_back(face);
+
+        SideGeom side;
+        side.nameId = nameId;
+        side.plane = planes[local];
+        side.faceIndex = (int)brush.faces.size() - 1;
+        BoundsOf(winding, side.mins, side.maxs);
+        side.winding = move(winding);
+        sides.sides.push_back(move(side));
+    }
+
+    if (brush.faces.size() > 4) {
+        vector<char> drop(brush.faces.size(), 0);
+        int keep = 0;
+        for (int i = 0; i < (int)brush.faces.size(); ++i) {
+            if (MinorSpan(sides.sides[i].winding, sides.sides[i].plane) < 0.75)
+                drop[i] = 1;
+            else
+                keep++;
+        }
+        if (keep >= 4) {
+            BrushOut kept;
+            kept.contents = brush.contents;
+            BuiltSides keptSides;
+            for (int i = 0; i < (int)brush.faces.size(); ++i) {
+                if (drop[i])
+                    continue;
+                sides.sides[i].faceIndex = (int)kept.faces.size();
+                kept.faces.push_back(move(brush.faces[i]));
+                keptSides.sides.push_back(move(sides.sides[i]));
+            }
+            brush = move(kept);
+            sides = move(keptSides);
+        }
+    }
+
+    return brush.faces.size() >= 4;
+}
+
+struct VertRef {
+    int type = 0;
+    int index = 0;
+    int nameId = 0;
+};
+
+template <typename Fn>
+void ForSoups(const BspFile& bsp, int model, Fn&& fn)
+{
+    const BspModel& mdl = bsp.models[model];
+    for (int type = 0; type < 2; ++type) {
+        int first = mdl.firstTriSoup[type];
+        int count = mdl.triSoupCount[type];
+        if (count == 0)
+            continue;
+        if (first < 0 || first + count > (int)bsp.soups[type].size())
+            throw runtime_error("model draw-surface range is outside the bsp");
+        for (int i = 0; i < count; ++i)
+            fn(type, bsp.soups[type][first + i]);
+    }
+}
+
+int ResolveVert(const BspTriSoup& soup, const vector<unsigned short>& indices, int i, int vertCount)
+{
+    if (i < 0 || i >= soup.indexCount)
+        return -1;
+    long long at = (long long)soup.firstIndex + i;
+    if (at < 0 || at >= (long long)indices.size())
+        return -1;
+    unsigned idx = indices[(size_t)at];
+    int resolved = (idx < soup.vertexCount) ? soup.firstVertex + (int)idx : (int)idx;
+    if (resolved < 0 || resolved >= vertCount)
+        return -1;
+    return resolved;
+}
+
+string ResolveLayered(const string& name, const BspFile& bsp);
+
+int MatchNameId(const BspFile& bsp, const Names& names, const vector<int>& matName, int matIndex)
+{
+    if (matIndex < 0 || matIndex >= (int)matName.size())
+        return -1;
+    string resolved = ResolveLayered(names.list[matName[matIndex]], bsp);
+    auto found = names.lookup.find(resolved);
+    if (found == names.lookup.end())
+        return matName[matIndex];
+    return found->second;
+}
+
+struct SideGrid {
+    static constexpr double kPad = 8.0;
+    static constexpr double kCell = 256.0;
+    struct Key {
+        int x, y, z;
+        bool operator==(const Key& o) const { return x == o.x && y == o.y && z == o.z; }
+    };
+    struct Hash {
+        size_t operator()(const Key& k) const
+        {
+            return ((size_t)k.x * 73856093u) ^ ((size_t)k.y * 19349663u) ^ ((size_t)k.z * 83492791u);
+        }
+    };
+    unordered_map<Key, vector<int>, Hash> cells;
+    vector<int> oversized;
+    vector<int> stamp;
+    int mark = 1;
+
+    static int bucket(double v) { return (int)floor(v / kCell); }
+
+    void build(const vector<SideGeom>& sides)
+    {
+        cells.clear();
+        oversized.clear();
+        stamp.assign(sides.size(), 0);
+        mark = 1;
+        for (int i = 0; i < (int)sides.size(); ++i) {
+            const SideGeom& side = sides[i];
+            int x0 = bucket(side.mins[0] - kPad);
+            int x1 = bucket(side.maxs[0] + kPad);
+            int y0 = bucket(side.mins[1] - kPad);
+            int y1 = bucket(side.maxs[1] + kPad);
+            int z0 = bucket(side.mins[2] - kPad);
+            int z1 = bucket(side.maxs[2] + kPad);
+            long long span = (long long)(x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1);
+            if (span > 4096) {
+                oversized.push_back(i);
+                continue;
+            }
+            for (int x = x0; x <= x1; ++x)
+                for (int y = y0; y <= y1; ++y)
+                    for (int z = z0; z <= z1; ++z)
+                        cells[{ x, y, z }].push_back(i);
+        }
+    }
+
+    template <typename Fn>
+    void query(const Vec3& a, const Vec3& b, const Vec3& c, Fn&& fn)
+    {
+        double minx = min(a.x, min(b.x, c.x));
+        double miny = min(a.y, min(b.y, c.y));
+        double minz = min(a.z, min(b.z, c.z));
+        double maxx = max(a.x, max(b.x, c.x));
+        double maxy = max(a.y, max(b.y, c.y));
+        double maxz = max(a.z, max(b.z, c.z));
+        int x0 = bucket(minx - kPad);
+        int x1 = bucket(maxx + kPad);
+        int y0 = bucket(miny - kPad);
+        int y1 = bucket(maxy + kPad);
+        int z0 = bucket(minz - kPad);
+        int z1 = bucket(maxz + kPad);
+        if (++mark == 0) {
+            fill(stamp.begin(), stamp.end(), 0);
+            mark = 1;
+        }
+        auto visit = [&](int idx) {
+            if (stamp[idx] == mark)
+                return;
+            stamp[idx] = mark;
+            fn(idx);
+        };
+        for (int idx : oversized)
+            visit(idx);
+        for (int x = x0; x <= x1; ++x) {
+            for (int y = y0; y <= y1; ++y) {
+                for (int z = z0; z <= z1; ++z) {
+                    auto found = cells.find({ x, y, z });
+                    if (found == cells.end())
+                        continue;
+                    for (int idx : found->second)
+                        visit(idx);
+                }
+            }
+        }
+    }
+};
+
+struct TexSample {
+    Vec3 p[3];
+    float st[3][2];
+    double area = 0;
+};
+
+void FitAllBrushTextures(const BspFile& bsp, int model, const Vec3& origin, const vector<int>& matName,
+                         const Names& names, vector<SideGeom>& sides, vector<BrushOut>& brushes,
+                         const vector<int>& brushSideStart)
+{
+    if (sides.empty())
+        return;
+    SideGrid grid;
+    grid.build(sides);
+    vector<TexSample> best(sides.size());
+
+    ForSoups(bsp, model, [&](int type, const BspTriSoup& soup) {
+        if (soup.materialIndex >= bsp.materials.size() || soup.indexCount < 3)
+            return;
+        int nameId = MatchNameId(bsp, names, matName, soup.materialIndex);
+        for (int i = 0; i + 2 < soup.indexCount; i += 3) {
+            int ia = ResolveVert(soup, bsp.indices[type], i, (int)bsp.verts[type].size());
+            int ib = ResolveVert(soup, bsp.indices[type], i + 1, (int)bsp.verts[type].size());
+            int ic = ResolveVert(soup, bsp.indices[type], i + 2, (int)bsp.verts[type].size());
+            if (ia < 0 || ib < 0 || ic < 0)
+                continue;
+            const BspDrawVert& va = bsp.verts[type][ia];
+            const BspDrawVert& vb = bsp.verts[type][ib];
+            const BspDrawVert& vc = bsp.verts[type][ic];
+            Vec3 a = FromVert(va, origin);
+            Vec3 b = FromVert(vb, origin);
+            Vec3 c = FromVert(vc, origin);
+            double area = Len(Cross(Sub(b, a), Sub(c, a)));
+            if (area < 0.01)
+                continue;
+            grid.query(a, b, c, [&](int sideIndex) {
+                const SideGeom& side = sides[sideIndex];
+                if (side.nameId != nameId || side.faceIndex < 0)
+                    return;
+                if (fabs(side.plane.Dist(a)) > kOnPlane || fabs(side.plane.Dist(b)) > kOnPlane || fabs(side.plane.Dist(c)) > kOnPlane)
+                    return;
+                Vec3 n = { side.plane.n[0], side.plane.n[1], side.plane.n[2] };
+                Vec3 mid = Mul(Add(Add(a, b), c), 1.0 / 3.0);
+                if (!InsideConvex(side.winding, mid, n, kInsideSlop))
+                    return;
+                if (area <= best[sideIndex].area)
+                    return;
+                TexSample sample;
+                sample.p[0] = a; sample.p[1] = b; sample.p[2] = c;
+                sample.st[0][0] = va.texCoord[0]; sample.st[0][1] = va.texCoord[1];
+                sample.st[1][0] = vb.texCoord[0]; sample.st[1][1] = vb.texCoord[1];
+                sample.st[2][0] = vc.texCoord[0]; sample.st[2][1] = vc.texCoord[1];
+                sample.area = area;
+                best[sideIndex] = sample;
+            });
+        }
+    });
+
+    for (int b = 0; b < (int)brushes.size(); ++b) {
+        int begin = brushSideStart[b];
+        int end = brushSideStart[b + 1];
+        BrushOut& brush = brushes[b];
+        vector<char> fitted(brush.faces.size(), 0);
+        vector<double> faceArea(brush.faces.size(), 0);
+        for (int s = begin; s < end; ++s) {
+            const SideGeom& side = sides[s];
+            if (best[s].area <= 0.0 || side.faceIndex < 0 || side.faceIndex >= (int)brush.faces.size())
+                continue;
+            vector<Hit> hits(3);
+            for (int k = 0; k < 3; ++k)
+                hits[k] = { best[s].p[k].x, best[s].p[k].y, best[s].p[k].z, best[s].st[k][0], best[s].st[k][1] };
+            if (!FitFace(hits, side.plane, brush.faces[side.faceIndex]))
+                continue;
+            fitted[side.faceIndex] = 1;
+            faceArea[side.faceIndex] = best[s].area;
+        }
+        for (int face = 0; face < (int)brush.faces.size(); ++face) {
+            if (fitted[face])
+                continue;
+            int donor = -1;
+            double donorArea = 0;
+            for (int other = 0; other < (int)brush.faces.size(); ++other) {
+                if (!fitted[other] || brush.faces[other].material != brush.faces[face].material)
+                    continue;
+                if (faceArea[other] > donorArea) {
+                    donor = other;
+                    donorArea = faceArea[other];
+                }
+            }
+            if (donor < 0)
+                continue;
+            brush.faces[face].scaleS = brush.faces[donor].scaleS;
+            brush.faces[face].scaleT = brush.faces[donor].scaleT;
+            brush.faces[face].shiftS = brush.faces[donor].shiftS;
+            brush.faces[face].shiftT = brush.faces[donor].shiftT;
+            brush.faces[face].rotate = brush.faces[donor].rotate;
+            brush.faces[face].skew = brush.faces[donor].skew;
+        }
+    }
+}
+
+bool TriangleOnSide(const SideGeom& side, const Vec3& a, const Vec3& b, const Vec3& c)
+{
+    if (fabs(side.plane.Dist(a)) > 1.0 || fabs(side.plane.Dist(b)) > 1.0 || fabs(side.plane.Dist(c)) > 1.0)
+        return false;
+    if (!BoundsOverlap(side.mins, side.maxs, a, b, c, 8.0))
+        return false;
+    Vec3 n = { side.plane.n[0], side.plane.n[1], side.plane.n[2] };
+    Vec3 mid = Mul(Add(Add(a, b), c), 1.0 / 3.0);
+    return InsideConvex(side.winding, mid, n, 8.0);
+}
+
+struct WeldKey {
+    long long x, y, z, s, t, color;
+    bool operator==(const WeldKey& o) const
+    {
+        return x == o.x && y == o.y && z == o.z && s == o.s && t == o.t && color == o.color;
+    }
+};
+
+struct WeldHash {
+    size_t operator()(const WeldKey& k) const
+    {
+        size_t h = (size_t)k.x * 73856093u;
+        h ^= (size_t)k.y * 19349663u;
+        h ^= (size_t)k.z * 83492791u;
+        h ^= (size_t)k.s * 83492791u;
+        h ^= (size_t)k.t * 19349663u;
+        h ^= (size_t)k.color * 19349663u;
+        return h;
+    }
+};
+
+struct TriKey {
+    int a, b, c;
+    bool operator==(const TriKey& o) const { return a == o.a && b == o.b && c == o.c; }
+};
+
+struct TriKeyHash {
+    size_t operator()(const TriKey& k) const
+    {
+        return ((size_t)k.a * 73856093u) ^ ((size_t)k.b * 19349663u) ^ ((size_t)k.c * 83492791u);
+    }
+};
+
+TriKey CanonTri(int a, int b, int c)
+{
+    if (b < a && b <= c)
+        return { b, c, a };
+    if (c < a && c <= b)
+        return { c, a, b };
+    return { a, b, c };
+}
+
+MeshVertOut ToMeshVert(const WeldVert& v)
+{
+    MeshVertOut out;
+    out.p = v.p;
+    out.st[0] = v.st[0];
+    out.st[1] = v.st[1];
+    out.lm[0] = v.lm[0];
+    out.lm[1] = v.lm[1];
+    out.n[0] = v.n[0];
+    out.n[1] = v.n[1];
+    out.n[2] = v.n[2];
+    memcpy(out.color, v.color, 4);
+    return out;
+}
+
+Vec3 MeshFaceNormal(const MeshOut& mesh)
+{
+    Vec3 zero{ 0, 0, 0 };
+    if (mesh.width < 2 || mesh.height < 2)
+        return zero;
+    for (int row = 0; row < mesh.height - 1; ++row) {
+        for (int col = 0; col < mesh.width - 1; ++col) {
+            const MeshVertOut& a = mesh.verts[(size_t)row * mesh.width + col];
+            const MeshVertOut& b = mesh.verts[(size_t)row * mesh.width + col + 1];
+            const MeshVertOut& d = mesh.verts[(size_t)(row + 1) * mesh.width + col];
+            Vec3 d1 = Sub(b.p, d.p);
+            Vec3 d2 = Sub(a.p, d.p);
+            Vec3 n = Cross(d2, d1);
+            if (Len(n) > 1e-4)
+                return n;
+        }
+    }
+    return zero;
+}
+
+void OrientMesh(MeshOut& mesh)
+{
+    Vec3 face = MeshFaceNormal(mesh);
+    if (Len(face) < 1e-4)
+        return;
+    Vec3 sum{ 0, 0, 0 };
+    int count = 0;
+    for (const MeshVertOut& vert : mesh.verts) {
+        if (vert.n[0] == 0.0f && vert.n[1] == 0.0f && vert.n[2] == 0.0f)
+            continue;
+        sum.x += vert.n[0];
+        sum.y += vert.n[1];
+        sum.z += vert.n[2];
+        count++;
+    }
+    if (!count || Dot(face, sum) >= 0.0)
+        return;
+    for (int col = 0; col < mesh.width; ++col) {
+        for (int row = 0; row < mesh.height / 2; ++row) {
+            swap(mesh.verts[(size_t)row * mesh.width + col],
+                 mesh.verts[(size_t)(mesh.height - 1 - row) * mesh.width + col]);
+        }
+    }
+    for (MeshVertOut& vert : mesh.verts)
+        vert.flag = 0;
+}
+
+void PushPieces(vector<MeshOut>& dest, MeshOut src, int& meshCount, int& vertCount)
+{
+    auto push = [&](MeshOut& piece) {
+        meshCount++;
+        vertCount += (int)piece.verts.size();
+        dest.push_back(move(piece));
+    };
+    if (src.width < 2 || src.height < 2 || (int)src.verts.size() != src.width * src.height)
+        return;
+    if (src.width <= kMaxPatch && src.height <= kMaxPatch) {
+        push(src);
+        return;
+    }
+    for (int u0 = 0; u0 < src.width - 1; ) {
+        int u1 = min(src.width, u0 + kMaxPatch);
+        for (int v0 = 0; v0 < src.height - 1; ) {
+            int v1 = min(src.height, v0 + kMaxPatch);
+            int sw = u1 - u0;
+            int sh = v1 - v0;
+            MeshOut piece;
+            piece.contents = src.contents;
+            piece.material = src.material;
+            piece.width = sw;
+            piece.height = sh;
+            piece.verts.resize((size_t)sw * sh);
+            for (int sv = 0; sv < sh; ++sv) {
+                for (int su = 0; su < sw; ++su) {
+                    MeshVertOut vert = src.verts[(size_t)(v0 + sv) * src.width + (u0 + su)];
+                    if (su == sw - 1 || sv == sh - 1)
+                        vert.flag = 0;
+                    piece.verts[(size_t)sv * sw + su] = vert;
+                }
+            }
+            push(piece);
+            if (v1 >= src.height)
+                break;
+            v0 = v1 - 1;
+        }
+        if (u1 >= src.width)
+            break;
+        u0 = u1 - 1;
+    }
+}
+
+bool OrderCCW(int v[4], const vector<WeldVert>& verts, const Vec3& n)
+{
+    Vec3 center{ 0, 0, 0 };
+    for (int i = 0; i < 4; ++i)
+        center = Add(center, verts[v[i]].p);
+    center = Mul(center, 0.25);
+    Vec3 tangent = Sub(verts[v[1]].p, verts[v[0]].p);
+    if (Len(tangent) < 1e-8)
+        tangent = { 1, 0, 0 };
+    else
+        tangent = Mul(tangent, 1.0 / Len(tangent));
+    Vec3 bitangent = Cross(n, tangent);
+
+    struct Item { int id; double ang; };
+    Item items[4];
+    for (int i = 0; i < 4; ++i) {
+        Vec3 d = Sub(verts[v[i]].p, center);
+        items[i] = { v[i], atan2(Dot(d, bitangent), Dot(d, tangent)) };
+    }
+    sort(items, items + 4, [](const Item& a, const Item& b) { return a.ang < b.ang; });
+    for (int i = 0; i < 4; ++i)
+        v[i] = items[i].id;
+    for (int i = 0; i < 4; ++i)
+        for (int j = i + 1; j < 4; ++j)
+            if (v[i] == v[j])
+                return false;
+    Vec3 facing = Cross(Sub(verts[v[1]].p, verts[v[0]].p), Sub(verts[v[2]].p, verts[v[0]].p));
+    if (Dot(facing, n) < 0)
+        swap(v[1], v[3]);
+    return true;
+}
+
+bool MakeQuad(const Tri& a, const Tri& b, int triA, int triB, const vector<WeldVert>& verts, Quad& quad)
+{
+    int idsA[3] = { a.a, a.b, a.c };
+    int idsB[3] = { b.a, b.b, b.c };
+    int shared[2], onlyA = -1, onlyB = -1, ns = 0;
+    for (int i = 0; i < 3; ++i) {
+        bool found = false;
+        for (int j = 0; j < 3; ++j)
+            found = found || idsA[i] == idsB[j];
+        if (found) {
+            if (ns < 2)
+                shared[ns++] = idsA[i];
+        } else {
+            onlyA = idsA[i];
+        }
+    }
+    for (int j = 0; j < 3; ++j) {
+        bool found = false;
+        for (int i = 0; i < 3; ++i)
+            found = found || idsB[j] == idsA[i];
+        if (!found)
+            onlyB = idsB[j];
+    }
+    if (ns != 2 || onlyA < 0 || onlyB < 0)
+        return false;
+    int v[4] = { idsA[0], idsA[1], idsA[2], onlyB };
+    Vec3 n = Cross(Sub(verts[a.b].p, verts[a.a].p), Sub(verts[a.c].p, verts[a.a].p));
+    if (Len(n) < 1e-8)
+        return false;
+    n = Mul(n, 1.0 / Len(n));
+    if (!OrderCCW(v, verts, n))
+        return false;
+    for (int i = 0; i < 4; ++i)
+        quad.v[i] = v[i];
+    quad.tri[0] = triA;
+    quad.tri[1] = triB;
+    return true;
+}
+
+struct GridCoord {
+    int u, v;
+};
+
+bool TryGrid(const vector<Quad>& quads, const vector<WeldVert>& verts, const vector<Tri>& tris,
+             unsigned contents, const string& material, vector<MeshOut>& dest, int& meshCount, int& vertCount)
+{
+    if (quads.empty() || quads.size() > 8192)
+        return false;
+
+    vector<int> degree(verts.size(), 0);
+    for (const Quad& q : quads)
+        for (int i = 0; i < 4; ++i)
+            if (q.v[i] >= 0 && q.v[i] < (int)degree.size())
+                degree[q.v[i]]++;
+
+    int startQuad = -1;
+    int startVert = -1;
+    for (int qi = 0; qi < (int)quads.size() && startQuad < 0; ++qi) {
+        for (int i = 0; i < 4; ++i) {
+            if (degree[quads[qi].v[i]] == 1) {
+                startQuad = qi;
+                startVert = quads[qi].v[i];
+                break;
+            }
+        }
+    }
+    if (startQuad < 0)
+        return false;
+
+    vector<Quad> local = quads;
+    int rot = 0;
+    for (; rot < 4; ++rot)
+        if (local[startQuad].v[rot] == startVert)
+            break;
+    if (rot == 4)
+        return false;
+    int rotated[4];
+    for (int k = 0; k < 4; ++k)
+        rotated[k] = local[startQuad].v[(rot + k) % 4];
+    for (int k = 0; k < 4; ++k)
+        local[startQuad].v[k] = rotated[k];
+
+    map<pair<int, int>, vector<int>> edgeQuads;
+    for (int qi = 0; qi < (int)local.size(); ++qi) {
+        for (int e = 0; e < 4; ++e) {
+            int a = local[qi].v[e];
+            int b = local[qi].v[(e + 1) % 4];
+            if (a > b)
+                swap(a, b);
+            edgeQuads[{ a, b }].push_back(qi);
+        }
+    }
+
+    unordered_map<int, GridCoord> coord;
+    vector<char> queued(local.size(), 0);
+    queue<int> pending;
+    pending.push(startQuad);
+    queued[startQuad] = 1;
+    bool seeded = false;
+    int visited = 0;
+
+    auto apply = [&](const Quad& q) -> bool {
+        int known = 0;
+        GridCoord at[4];
+        bool has[4] = {};
+        for (int i = 0; i < 4; ++i) {
+            auto found = coord.find(q.v[i]);
+            if (found != coord.end()) {
+                has[i] = true;
+                at[i] = found->second;
+                known++;
+            }
+        }
+        if (known == 0) {
+            if (seeded)
+                return false;
+            seeded = true;
+            coord[q.v[0]] = { 0, 0 };
+            coord[q.v[1]] = { 1, 0 };
+            coord[q.v[2]] = { 1, 1 };
+            coord[q.v[3]] = { 0, 1 };
+            return true;
+        }
+        for (int i = 0; i < 4; ++i) {
+            int j = (i + 1) % 4;
+            if (!has[i] || !has[j])
+                continue;
+            int du = at[j].u - at[i].u;
+            int dv = at[j].v - at[i].v;
+            if (du * du + dv * dv != 1)
+                continue;
+            int ru = -dv;
+            int rv = du;
+            GridCoord expect[4];
+            expect[i] = at[i];
+            expect[j] = at[j];
+            expect[(i + 2) % 4] = { at[j].u + ru, at[j].v + rv };
+            expect[(i + 3) % 4] = { at[i].u + ru, at[i].v + rv };
+            for (int k = 0; k < 4; ++k) {
+                auto found = coord.find(q.v[k]);
+                if (found == coord.end())
+                    coord[q.v[k]] = expect[k];
+                else if (found->second.u != expect[k].u || found->second.v != expect[k].v)
+                    return false;
+            }
+            return true;
+        }
+        return false;
+    };
+
+    while (!pending.empty()) {
+        int qi = pending.front();
+        pending.pop();
+        if (!apply(local[qi]))
+            return false;
+        visited++;
+        for (int e = 0; e < 4; ++e) {
+            int a = local[qi].v[e];
+            int b = local[qi].v[(e + 1) % 4];
+            if (a > b)
+                swap(a, b);
+            for (int other : edgeQuads[{ a, b }]) {
+                if (!queued[other]) {
+                    queued[other] = 1;
+                    pending.push(other);
+                }
+            }
+        }
+    }
+    if (visited != (int)local.size())
+        return false;
+
+    int minU = 0, minV = 0, maxU = 0, maxV = 0;
+    bool init = false;
+    for (const auto& item : coord) {
+        if (!init) {
+            minU = maxU = item.second.u;
+            minV = maxV = item.second.v;
+            init = true;
+        } else {
+            minU = min(minU, item.second.u);
+            minV = min(minV, item.second.v);
+            maxU = max(maxU, item.second.u);
+            maxV = max(maxV, item.second.v);
+        }
+    }
+    int width = maxU - minU + 1;
+    int height = maxV - minV + 1;
+    if (width < 2 || height < 2 || width > 128 || height > 128)
+        return false;
+    if ((long long)width * height != (long long)coord.size())
+        return false;
+
+    vector<int> at((size_t)width * height, -1);
+    for (const auto& item : coord) {
+        int u = item.second.u - minU;
+        int v = item.second.v - minV;
+        int slot = v * width + u;
+        if (at[slot] != -1)
+            return false;
+        at[slot] = item.first;
+    }
+    for (int id : at)
+        if (id < 0)
+            return false;
+
+    unordered_set<TriKey, TriKeyHash> triSet;
+    for (const Tri& tri : tris)
+        triSet.insert(CanonTri(tri.a, tri.b, tri.c));
+
+    MeshOut mesh;
+    mesh.contents = contents;
+    mesh.material = material;
+    mesh.width = width;
+    mesh.height = height;
+    mesh.verts.resize((size_t)width * height);
+    for (int v = 0; v < height; ++v) {
+        for (int u = 0; u < width; ++u) {
+            mesh.verts[(size_t)v * width + u] = ToMeshVert(verts[at[(size_t)v * width + u]]);
+            if (u + 1 >= width || v + 1 >= height)
+                continue;
+            int A = at[(size_t)v * width + u];
+            int B = at[(size_t)v * width + (u + 1)];
+            int C = at[(size_t)(v + 1) * width + (u + 1)];
+            int D = at[(size_t)(v + 1) * width + u];
+            bool flag1 = triSet.count(CanonTri(A, C, B)) || triSet.count(CanonTri(C, A, D));
+            bool flag0 = triSet.count(CanonTri(D, B, A)) || triSet.count(CanonTri(B, D, C));
+            if (flag1 && !flag0)
+                mesh.verts[(size_t)v * width + u].flag = 1;
+        }
+    }
+    PushPieces(dest, move(mesh), meshCount, vertCount);
+    return true;
+}
+
+void EmitQuad(const Quad& quad, const vector<WeldVert>& verts, const vector<Tri>& tris,
+              unsigned contents, const string& material, vector<MeshOut>& dest,
+              int& meshCount, int& vertCount)
+{
+    MeshOut mesh;
+    mesh.contents = contents;
+    mesh.material = material;
+    mesh.width = 2;
+    mesh.height = 2;
+    mesh.verts.resize(4);
+    mesh.verts[0] = ToMeshVert(verts[quad.v[0]]);
+    mesh.verts[1] = ToMeshVert(verts[quad.v[1]]);
+    mesh.verts[2] = ToMeshVert(verts[quad.v[3]]);
+    mesh.verts[3] = ToMeshVert(verts[quad.v[2]]);
+
+    unordered_set<TriKey, TriKeyHash> triSet;
+    triSet.insert(CanonTri(tris[quad.tri[0]].a, tris[quad.tri[0]].b, tris[quad.tri[0]].c));
+    triSet.insert(CanonTri(tris[quad.tri[1]].a, tris[quad.tri[1]].b, tris[quad.tri[1]].c));
+    int A = quad.v[0], B = quad.v[1], C = quad.v[2], D = quad.v[3];
+    bool flag1 = triSet.count(CanonTri(A, C, B)) || triSet.count(CanonTri(C, A, D));
+    bool flag0 = triSet.count(CanonTri(D, B, A)) || triSet.count(CanonTri(B, D, C));
+    if (flag1 && !flag0)
+        mesh.verts[0].flag = 1;
+    PushPieces(dest, move(mesh), meshCount, vertCount);
+}
+
+void EmitLooseTri(const Tri& tri, const vector<WeldVert>& verts, unsigned contents, const string& material,
+                  vector<MeshOut>& dest, int& meshCount, int& vertCount, int& triMeshes)
+{
+    MeshOut mesh;
+    mesh.contents = contents;
+    mesh.material = material;
+    mesh.width = 2;
+    mesh.height = 2;
+    mesh.verts.resize(4);
+    mesh.verts[0] = ToMeshVert(verts[tri.c]);
+    mesh.verts[1] = ToMeshVert(verts[tri.b]);
+    mesh.verts[2] = ToMeshVert(verts[tri.a]);
+    mesh.verts[3] = ToMeshVert(verts[tri.a]);
+    triMeshes++;
+    PushPieces(dest, move(mesh), meshCount, vertCount);
+}
+
+double EdgeLen2(const vector<WeldVert>& verts, int a, int b)
+{
+    Vec3 d = Sub(verts[a].p, verts[b].p);
+    return Dot(d, d);
+}
+
+void LongestEdge(const Tri& tri, const vector<WeldVert>& verts, int& a, int& b)
+{
+    double ab = EdgeLen2(verts, tri.a, tri.b);
+    double bc = EdgeLen2(verts, tri.b, tri.c);
+    double ca = EdgeLen2(verts, tri.c, tri.a);
+    if (ab >= bc && ab >= ca) { a = tri.a; b = tri.b; }
+    else if (bc >= ca) { a = tri.b; b = tri.c; }
+    else { a = tri.c; b = tri.a; }
+}
+
+bool SharedEdgeVerts(const Tri& a, const Tri& b, int& s0, int& s1)
+{
+    int va[3] = { a.a, a.b, a.c };
+    int vb[3] = { b.a, b.b, b.c };
+    int found[2];
+    int count = 0;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            if (va[i] != vb[j])
+                continue;
+            if (count < 2)
+                found[count] = va[i];
+            count++;
+        }
+    }
+    if (count != 2)
+        return false;
+    s0 = found[0];
+    s1 = found[1];
+    return true;
+}
+
+bool DirectedShared(const Tri& tri, int s0, int s1, int& from, int& to, int& unique)
+{
+    int v[3] = { tri.a, tri.b, tri.c };
+    for (int i = 0; i < 3; ++i) {
+        int x = v[i];
+        int y = v[(i + 1) % 3];
+        int z = v[(i + 2) % 3];
+        if ((x == s0 && y == s1) || (x == s1 && y == s0)) {
+            from = x;
+            to = y;
+            unique = z;
+            return true;
+        }
+    }
+    return false;
+}
+
+struct PatchCell {
+    int A, B, C, D;
+};
+
+bool LabelPatchCell(const Tri& t0, const Tri& t1, const vector<WeldVert>& verts, PatchCell& cell)
+{
+    int s0, s1;
+    if (!SharedEdgeVerts(t0, t1, s0, s1))
+        return false;
+    int from0, to0, unique0, from1, to1, unique1;
+    if (!DirectedShared(t0, s0, s1, from0, to0, unique0))
+        return false;
+    if (!DirectedShared(t1, s0, s1, from1, to1, unique1))
+        return false;
+    if (from1 != to0 || to1 != from0)
+        return false;
+    cell.D = from0;
+    cell.B = to0;
+    cell.A = unique0;
+    cell.C = unique1;
+    if (cell.A == cell.B || cell.A == cell.C || cell.A == cell.D
+        || cell.B == cell.C || cell.B == cell.D || cell.C == cell.D)
+        return false;
+
+    const Vec3& a = verts[cell.A].p;
+    const Vec3& b = verts[cell.B].p;
+    const Vec3& d = verts[cell.D].p;
+    const Vec3& c = verts[cell.C].p;
+    Vec3 shared = Sub(b, d);
+    double sharedLen = Len(shared);
+    if (sharedLen < 1e-4)
+        return false;
+    return Dot(Cross(shared, Sub(a, d)), Cross(shared, Sub(c, d))) < 0.0;
+}
+
+void EdgeSt(const vector<WeldVert>& verts, int i, int j, double& ds, double& dt)
+{
+    ds = fabs((double)verts[i].st[0] - (double)verts[j].st[0]);
+    dt = fabs((double)verts[i].st[1] - (double)verts[j].st[1]);
+}
+
+// MeshToTriangles splits each grid cell on a diagonal. On a patch the diagonal
+// moves both texture axes; a grid edge keeps one axis fixed.
+bool DiagonalInSt(const PatchCell& cell, const vector<WeldVert>& verts)
+{
+    double ds, dt;
+    EdgeSt(verts, cell.D, cell.B, ds, dt);
+    double minor = min(ds, dt);
+    double major = max(ds, dt);
+    if (major < 1e-7)
+        return false;
+    int edges[4][2] = {
+        { cell.A, cell.B }, { cell.B, cell.C }, { cell.C, cell.D }, { cell.D, cell.A }
+    };
+    double sideMinor = 0;
+    for (int e = 0; e < 4; ++e) {
+        double a, b;
+        EdgeSt(verts, edges[e][0], edges[e][1], a, b);
+        sideMinor = max(sideMinor, min(a, b));
+    }
+    return minor > sideMinor * 2.0 + 1e-8;
+}
+
+bool EdgeIsLongest(const Tri& tri, const vector<WeldVert>& verts, int a, int b)
+{
+    double ab = EdgeLen2(verts, tri.a, tri.b);
+    double bc = EdgeLen2(verts, tri.b, tri.c);
+    double ca = EdgeLen2(verts, tri.c, tri.a);
+    double shared = EdgeLen2(verts, a, b);
+    return shared >= ab - 1e-8 && shared >= bc - 1e-8 && shared >= ca - 1e-8;
+}
+
+void EmitPatchCell(const PatchCell& cell, const vector<WeldVert>& verts, unsigned contents,
+                   const string& material, vector<MeshOut>& dest, int& meshCount, int& vertCount)
+{
+    MeshOut mesh;
+    mesh.contents = contents;
+    mesh.material = material;
+    mesh.width = 2;
+    mesh.height = 2;
+    mesh.verts.resize(4);
+    mesh.verts[0] = ToMeshVert(verts[cell.A]);
+    mesh.verts[1] = ToMeshVert(verts[cell.B]);
+    mesh.verts[2] = ToMeshVert(verts[cell.D]);
+    mesh.verts[3] = ToMeshVert(verts[cell.C]);
+    PushPieces(dest, move(mesh), meshCount, vertCount);
+}
+
+bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& verts, unsigned contents,
+                       const string& material, vector<MeshOut>& dest, int& meshCount, int& vertCount)
+{
+    if (cells.empty())
+        return false;
+
+    struct GV { int u, v; };
+    unordered_map<int, GV> coord;
+    vector<char> placed(cells.size(), 0);
+    coord[cells[0].A] = { 0, 0 };
+    coord[cells[0].B] = { 1, 0 };
+    coord[cells[0].C] = { 1, 1 };
+    coord[cells[0].D] = { 0, 1 };
+    placed[0] = 1;
+
+    unordered_map<int, vector<int>> vertCells;
+    vertCells.reserve(cells.size() * 2);
+    for (int i = 0; i < (int)cells.size(); ++i) {
+        int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
+        for (int k = 0; k < 4; ++k)
+            vertCells[id[k]].push_back(i);
+    }
+    vector<char> queued(cells.size(), 0);
+    queue<int> pending;
+    auto touch = [&](int cellIndex) {
+        if (placed[cellIndex] || queued[cellIndex])
+            return;
+        queued[cellIndex] = 1;
+        pending.push(cellIndex);
+    };
+    auto tryPlace = [&](int i) -> bool {
+        int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
+        int lu[4] = { 0, 1, 1, 0 };
+        int lv[4] = { 0, 0, 1, 1 };
+        int known[4], nKnown = 0;
+        for (int k = 0; k < 4; ++k)
+            if (coord.find(id[k]) != coord.end())
+                known[nKnown++] = k;
+        if (nKnown < 2)
+            return false;
+
+        bool fitted = false;
+        int originU = 0, originV = 0;
+        int useMirror = 0, useRot = 0;
+        for (int mirror = 0; mirror < 2 && !fitted; ++mirror) {
+            for (int rot = 0; rot < 4 && !fitted; ++rot) {
+                auto xform = [&](int u, int v, int& ou, int& ov) {
+                    if (mirror)
+                        u = -u;
+                    for (int r = 0; r < rot; ++r) {
+                        int tmp = u;
+                        u = -v;
+                        v = tmp;
+                    }
+                    ou = u;
+                    ov = v;
+                };
+                int aU, aV, bU, bV;
+                xform(lu[known[0]], lv[known[0]], aU, aV);
+                xform(lu[known[1]], lv[known[1]], bU, bV);
+                int du = coord[id[known[1]]].u - coord[id[known[0]]].u;
+                int dv = coord[id[known[1]]].v - coord[id[known[0]]].v;
+                if (bU - aU != du || bV - aV != dv)
+                    continue;
+                originU = coord[id[known[0]]].u - aU;
+                originV = coord[id[known[0]]].v - aV;
+                fitted = true;
+                for (int k = 0; k < nKnown; ++k) {
+                    int ou, ov;
+                    xform(lu[known[k]], lv[known[k]], ou, ov);
+                    if (coord[id[known[k]]].u != originU + ou || coord[id[known[k]]].v != originV + ov)
+                        fitted = false;
+                }
+                if (fitted) {
+                    useMirror = mirror;
+                    useRot = rot;
+                }
+            }
+        }
+        if (!fitted)
+            return false;
+
+        auto xform = [&](int u, int v, int& ou, int& ov) {
+            if (useMirror)
+                u = -u;
+            for (int r = 0; r < useRot; ++r) {
+                int tmp = u;
+                u = -v;
+                v = tmp;
+            }
+            ou = u;
+            ov = v;
+        };
+        GV next[4];
+        for (int k = 0; k < 4; ++k) {
+            int ou, ov;
+            xform(lu[k], lv[k], ou, ov);
+            next[k] = { originU + ou, originV + ov };
+            auto found = coord.find(id[k]);
+            if (found != coord.end() && (found->second.u != next[k].u || found->second.v != next[k].v))
+                return false;
+        }
+        for (int k = 0; k < 4; ++k)
+            coord[id[k]] = next[k];
+        placed[i] = 1;
+        return true;
+    };
+    for (int id : { cells[0].A, cells[0].B, cells[0].C, cells[0].D })
+        for (int other : vertCells[id])
+            touch(other);
+    while (!pending.empty()) {
+        int i = pending.front();
+        pending.pop();
+        queued[i] = 0;
+        if (placed[i])
+            continue;
+        if (!tryPlace(i))
+            continue;
+        for (int id : { cells[i].A, cells[i].B, cells[i].C, cells[i].D })
+            for (int other : vertCells[id])
+                touch(other);
+    }
+
+    map<pair<int, int>, int> atVert;
+    for (const auto& item : coord)
+        atVert[{ item.second.u, item.second.v }] = item.first;
+
+    map<pair<int, int>, int> occ;
+    for (int i = 0; i < (int)cells.size(); ++i) {
+        if (!placed[i])
+            continue;
+        int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
+        int u0 = coord[id[0]].u;
+        int v0 = coord[id[0]].v;
+        for (int k = 1; k < 4; ++k) {
+            u0 = min(u0, coord[id[k]].u);
+            v0 = min(v0, coord[id[k]].v);
+        }
+        occ[{ u0, v0 }] = i;
+    }
+
+    auto emitRect = [&](int u0, int v0, int cellsW, int cellsH) -> bool {
+        int width = cellsW + 1;
+        int height = cellsH + 1;
+        MeshOut mesh;
+        mesh.contents = contents;
+        mesh.material = material;
+        mesh.width = width;
+        mesh.height = height;
+        mesh.verts.assign((size_t)width * height, MeshVertOut{});
+        for (int v = 0; v < height; ++v) {
+            for (int u = 0; u < width; ++u) {
+                auto found = atVert.find({ u0 + u, v0 + v });
+                if (found == atVert.end())
+                    return false;
+                mesh.verts[(size_t)v * width + u] = ToMeshVert(verts[found->second]);
+            }
+        }
+        for (int cv = 0; cv < cellsH; ++cv) {
+            for (int cu = 0; cu < cellsW; ++cu) {
+                auto found = occ.find({ u0 + cu, v0 + cv });
+                if (found == occ.end())
+                    continue;
+                const PatchCell& cell = cells[found->second];
+                int bu = coord[cell.B].u;
+                int bv = coord[cell.B].v;
+                int du = coord[cell.D].u;
+                int dv = coord[cell.D].v;
+                bool ends[2][2] = {};
+                int eu[2] = { bu, du };
+                int ev[2] = { bv, dv };
+                for (int k = 0; k < 2; ++k) {
+                    int lu = eu[k] - (u0 + cu);
+                    int lv = ev[k] - (v0 + cv);
+                    if (lu >= 0 && lu <= 1 && lv >= 0 && lv <= 1)
+                        ends[lu][lv] = true;
+                }
+                if (ends[0][0] && ends[1][1])
+                    mesh.verts[(size_t)cv * width + cu].flag = 1;
+            }
+        }
+        PushPieces(dest, move(mesh), meshCount, vertCount);
+        return true;
+    };
+
+    map<pair<int, int>, char> taken;
+    for (const auto& item : occ)
+        taken[item.first] = 0;
+    for (const auto& item : occ) {
+        if (taken[item.first])
+            continue;
+        int u0 = item.first.first;
+        int v0 = item.first.second;
+        int cellsW = 0;
+        while (occ.count({ u0 + cellsW, v0 }) && !taken[{ u0 + cellsW, v0 }])
+            cellsW++;
+        int cellsH = 0;
+        bool rowOk = true;
+        while (rowOk) {
+            for (int u = 0; u < cellsW; ++u) {
+                pair<int, int> key{ u0 + u, v0 + cellsH };
+                if (!occ.count(key) || taken[key])
+                    rowOk = false;
+            }
+            if (rowOk)
+                cellsH++;
+        }
+        if (cellsW < 1 || cellsH < 1)
+            continue;
+        if (!emitRect(u0, v0, cellsW, cellsH)) {
+            for (int v = 0; v < cellsH; ++v) {
+                for (int u = 0; u < cellsW; ++u) {
+                    auto found = occ.find({ u0 + u, v0 + v });
+                    if (found != occ.end())
+                        EmitPatchCell(cells[found->second], verts, contents, material, dest, meshCount, vertCount);
+                    taken[{ u0 + u, v0 + v }] = 1;
+                }
+            }
+            continue;
+        }
+        for (int v = 0; v < cellsH; ++v)
+            for (int u = 0; u < cellsW; ++u)
+                taken[{ u0 + u, v0 + v }] = 1;
+    }
+
+    for (int i = 0; i < (int)cells.size(); ++i) {
+        if (!placed[i])
+            EmitPatchCell(cells[i], verts, contents, material, dest, meshCount, vertCount);
+    }
+    return true;
+}
+
+bool RecoverClosedBrushes(const vector<WeldVert>& verts, const vector<Tri>& tris, unsigned contents,
+                          const string& material, vector<BrushOut>& brushes, vector<char>& used);
+
+void BuildMeshes(const vector<WeldVert>& verts, const vector<Tri>& tris, unsigned contents,
+                 const string& material, vector<MeshOut>& dest, int& meshCount, int& vertCount, int& triMeshes)
+{
+    if (tris.empty())
+        return;
+
+    map<pair<int, int>, vector<int>> edges;
+    for (int i = 0; i < (int)tris.size(); ++i) {
+        int e[3][2] = { { tris[i].a, tris[i].b }, { tris[i].b, tris[i].c }, { tris[i].c, tris[i].a } };
+        for (int k = 0; k < 3; ++k) {
+            int a = e[k][0], b = e[k][1];
+            if (a > b)
+                swap(a, b);
+            edges[{ a, b }].push_back(i);
+        }
+    }
+
+    struct Candidate {
+        int t0, t1;
+        PatchCell cell;
+        double score;
+        bool st;
+    };
+    vector<Candidate> stCells;
+    vector<Candidate> longCells;
+    for (const auto& entry : edges) {
+        if (entry.second.size() != 2)
+            continue;
+        int t0 = entry.second[0];
+        int t1 = entry.second[1];
+        PatchCell cell;
+        if (!LabelPatchCell(tris[t0], tris[t1], verts, cell))
+            continue;
+        Candidate candidate;
+        candidate.t0 = t0;
+        candidate.t1 = t1;
+        candidate.cell = cell;
+        candidate.st = DiagonalInSt(cell, verts);
+        Vec3 predicted = Add(verts[cell.B].p, Sub(verts[cell.D].p, verts[cell.A].p));
+        candidate.score = Len(Sub(verts[cell.C].p, predicted));
+        if (candidate.st)
+            stCells.push_back(candidate);
+        else if (EdgeIsLongest(tris[t0], verts, entry.first.first, entry.first.second)
+                 && EdgeIsLongest(tris[t1], verts, entry.first.first, entry.first.second))
+            longCells.push_back(candidate);
+    }
+    sort(stCells.begin(), stCells.end(), [](const Candidate& a, const Candidate& b) { return a.score < b.score; });
+    sort(longCells.begin(), longCells.end(), [](const Candidate& a, const Candidate& b) { return a.score < b.score; });
+
+    vector<char> used(tris.size(), 0);
+    vector<PatchCell> cells;
+    auto take = [&](const vector<Candidate>& list) {
+        for (const Candidate& candidate : list) {
+            if (used[candidate.t0] || used[candidate.t1])
+                continue;
+            used[candidate.t0] = used[candidate.t1] = 1;
+            cells.push_back(candidate.cell);
+        }
+    };
+    take(stCells);
+    take(longCells);
+
+    vector<int> parent(cells.size());
+    for (int i = 0; i < (int)cells.size(); ++i)
+        parent[i] = i;
+    auto find = [&](auto&& self, int x) -> int {
+        return parent[x] == x ? x : parent[x] = self(self, parent[x]);
+    };
+    map<pair<int, int>, int> boundary;
+    for (int i = 0; i < (int)cells.size(); ++i) {
+        int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
+        int e[4][2] = { { 0, 1 }, { 1, 2 }, { 2, 3 }, { 3, 0 } };
+        for (int k = 0; k < 4; ++k) {
+            int a = id[e[k][0]];
+            int b = id[e[k][1]];
+            if (a > b)
+                swap(a, b);
+            auto found = boundary.find({ a, b });
+            if (found == boundary.end())
+                boundary[{ a, b }] = i;
+            else {
+                int pa = find(find, i);
+                int pb = find(find, found->second);
+                if (pa != pb)
+                    parent[pa] = pb;
+            }
+        }
+    }
+
+    map<int, vector<PatchCell>> groups;
+    for (int i = 0; i < (int)cells.size(); ++i)
+        groups[find(find, i)].push_back(cells[i]);
+    for (auto& group : groups)
+        EmitStitchedPatch(group.second, verts, contents, material, dest, meshCount, vertCount);
+    for (int i = 0; i < (int)tris.size(); ++i) {
+        if (!used[i])
+            EmitLooseTri(tris[i], verts, contents, material, dest, meshCount, vertCount, triMeshes);
+    }
+}
+
+string ResolveLayered(const string& name, const BspFile& bsp)
+{
+    if (name.size() < 2 || name[0] != '*')
+        return name;
+    int index = 0;
+    size_t i = 1;
+    if (!isdigit((unsigned char)name[i]))
+        return name;
+    while (i < name.size() && isdigit((unsigned char)name[i])) {
+        index = index * 10 + (name[i] - '0');
+        ++i;
+    }
+    if (index < 0 || index >= (int)bsp.materials.size())
+        return name;
+    string inner = MaterialName(bsp.materials[index]);
+    if (inner.empty() || inner[0] == '*')
+        return name;
+    return inner;
+}
+
+struct BucketKey {
+    int nameId;
+    unsigned contents;
+    bool operator==(const BucketKey& o) const { return nameId == o.nameId && contents == o.contents; }
+};
+
+struct BucketHash {
+    size_t operator()(const BucketKey& k) const
+    {
+        return ((size_t)k.nameId * 73856093u) ^ (k.contents * 19349663u);
+    }
+};
+
+struct PosKey {
+    int nameId;
+    int p[9];
+    bool operator==(const PosKey& o) const
+    {
+        if (nameId != o.nameId)
+            return false;
+        for (int i = 0; i < 9; ++i)
+            if (p[i] != o.p[i])
+                return false;
+        return true;
+    }
+};
+
+struct PosHash {
+    size_t operator()(const PosKey& k) const
+    {
+        size_t h = (size_t)k.nameId * 73856093u;
+        for (int i = 0; i < 9; ++i)
+            h ^= (size_t)k.p[i] * (19349663u + (unsigned)i * 17u);
+        return h;
+    }
+};
+
+ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, const vector<int>& matName,
+                    const Names& names, int caulk, int& dropped, int& meshCount, int& vertCount, int& triMeshes)
+{
+    ModelGeo geo;
+    const BspModel& model = bsp.models[modelIndex];
+    if (model.firstBrush < 0 || model.numBrushes < 0
+        || model.firstBrush + model.numBrushes > (int)bsp.brushes.size())
+        throw runtime_error("model brush range is outside the bsp");
+
+    vector<int> sideStart(bsp.brushes.size() + 1, 0);
+    for (int i = 0; i < (int)bsp.brushes.size(); ++i)
+        sideStart[i + 1] = sideStart[i] + bsp.brushes[i].numSides;
+
+    vector<int> edgeStart(bsp.sides.size() + 1, 0);
+    if (bsp.edgeCounts.size() == bsp.sides.size()) {
+        for (int i = 0; i < (int)bsp.sides.size(); ++i)
+            edgeStart[i + 1] = edgeStart[i] + bsp.edgeCounts[i];
+    }
+
+    vector<SideGeom> allSides;
+    vector<int> brushSideStart;
+    brushSideStart.push_back(0);
+    for (int b = 0; b < model.numBrushes; ++b) {
+        int brushIndex = model.firstBrush + b;
+        BrushOut brush;
+        BuiltSides built;
+        if (!BuildBrush(bsp, brushIndex, sideStart[brushIndex], origin, matName, names, caulk, edgeStart, brush, built)) {
+            dropped++;
+            continue;
+        }
+        for (SideGeom& side : built.sides)
+            allSides.push_back(move(side));
+        brushSideStart.push_back((int)allSides.size());
+        geo.brushes.push_back(move(brush));
+    }
+
+    for (int b = 0; b < (int)geo.brushes.size(); ++b) {
+        int begin = brushSideStart[b];
+        int end = brushSideStart[b + 1];
+        for (int i = begin; i < end; ++i) {
+            SideGeom& side = allSides[i];
+            if (side.nameId < 0 || side.nameId >= (int)names.list.size())
+                continue;
+            string resolved = ResolveLayered(names.list[side.nameId], bsp);
+            auto found = names.lookup.find(resolved);
+            if (found != names.lookup.end())
+                side.nameId = found->second;
+            if (side.faceIndex >= 0 && side.faceIndex < (int)geo.brushes[b].faces.size())
+                geo.brushes[b].faces[side.faceIndex].material = resolved;
+        }
+    }
+    FitAllBrushTextures(bsp, modelIndex, origin, matName, names, allSides, geo.brushes, brushSideStart);
+
+    vector<SideGeom> live;
+    for (SideGeom& side : allSides)
+        if (!side.winding.empty())
+            live.push_back(move(side));
+
+    SideGrid sideGrid;
+    sideGrid.build(live);
+
+    vector<WeldVert> weld;
+    unordered_map<WeldKey, int, WeldHash> weldLookup;
+    unordered_map<BucketKey, vector<Tri>, BucketHash> buckets;
+    unordered_set<PosKey, PosHash> seenTris;
+
+    auto weldPoint = [&](const BspDrawVert& vert) -> int {
+        Vec3 p = FromVert(vert, origin);
+        WeldKey key;
+        key.x = llround(p.x * 100.0);
+        key.y = llround(p.y * 100.0);
+        key.z = llround(p.z * 100.0);
+        key.s = llround((double)vert.texCoord[0] * 100000.0);
+        key.t = llround((double)vert.texCoord[1] * 100000.0);
+        key.color = ((long long)vert.color[0] << 24) | ((long long)vert.color[1] << 16)
+                  | ((long long)vert.color[2] << 8) | vert.color[3];
+        auto found = weldLookup.find(key);
+        if (found != weldLookup.end())
+            return found->second;
+        WeldVert out;
+        out.p = p;
+        out.st[0] = vert.texCoord[0];
+        out.st[1] = vert.texCoord[1];
+        out.lm[0] = vert.lmapCoord[0];
+        out.lm[1] = vert.lmapCoord[1];
+        out.n[0] = vert.normal[0];
+        out.n[1] = vert.normal[1];
+        out.n[2] = vert.normal[2];
+        memcpy(out.color, vert.color, 4);
+        int id = (int)weld.size();
+        weld.push_back(out);
+        weldLookup.emplace(key, id);
+        return id;
+    };
+
+    ForSoups(bsp, modelIndex, [&](int type, const BspTriSoup& soup) {
+        if (soup.materialIndex >= bsp.materials.size() || soup.indexCount < 3)
+            return;
+        int nameId = MatchNameId(bsp, names, matName, soup.materialIndex);
+        unsigned contents = bsp.materials[soup.materialIndex].contentFlags;
+        for (int i = 0; i + 2 < soup.indexCount; i += 3) {
+            int ia = ResolveVert(soup, bsp.indices[type], i, (int)bsp.verts[type].size());
+            int ib = ResolveVert(soup, bsp.indices[type], i + 1, (int)bsp.verts[type].size());
+            int ic = ResolveVert(soup, bsp.indices[type], i + 2, (int)bsp.verts[type].size());
+            if (ia < 0 || ib < 0 || ic < 0)
+                continue;
+            Vec3 a = FromVert(bsp.verts[type][ia], origin);
+            Vec3 b = FromVert(bsp.verts[type][ib], origin);
+            Vec3 c = FromVert(bsp.verts[type][ic], origin);
+            if (Len(Cross(Sub(b, a), Sub(c, a))) < 0.01)
+                continue;
+            bool covered = false;
+            sideGrid.query(a, b, c, [&](int sideIndex) {
+                if (covered || live[sideIndex].nameId != nameId)
+                    return;
+                if (TriangleOnSide(live[sideIndex], a, b, c))
+                    covered = true;
+            });
+            if (covered)
+                continue;
+
+            struct PointKey { int x, y, z; };
+            PointKey points[3] = {
+                { (int)llround(a.x * 4), (int)llround(a.y * 4), (int)llround(a.z * 4) },
+                { (int)llround(b.x * 4), (int)llround(b.y * 4), (int)llround(b.z * 4) },
+                { (int)llround(c.x * 4), (int)llround(c.y * 4), (int)llround(c.z * 4) }
+            };
+            sort(points, points + 3, [](const PointKey& lhs, const PointKey& rhs) {
+                if (lhs.x != rhs.x) return lhs.x < rhs.x;
+                if (lhs.y != rhs.y) return lhs.y < rhs.y;
+                return lhs.z < rhs.z;
+            });
+            PosKey pos;
+            pos.nameId = nameId;
+            for (int p = 0; p < 3; ++p) {
+                pos.p[p * 3 + 0] = points[p].x;
+                pos.p[p * 3 + 1] = points[p].y;
+                pos.p[p * 3 + 2] = points[p].z;
+            }
+            if (!seenTris.insert(pos).second)
+                continue;
+
+            Tri tri;
+            tri.a = weldPoint(bsp.verts[type][ia]);
+            tri.b = weldPoint(bsp.verts[type][ib]);
+            tri.c = weldPoint(bsp.verts[type][ic]);
+            buckets[{ nameId, contents }].push_back(tri);
+        }
+    });
+
+    for (auto& bucket : buckets) {
+        int nameId = bucket.first.nameId;
+        string raw = (nameId >= 0 && nameId < (int)names.list.size()) ? names.list[nameId] : "caulk";
+        string material = ResolveLayered(raw, bsp);
+        vector<char> consumed(bucket.second.size(), 0);
+        RecoverClosedBrushes(weld, bucket.second, bucket.first.contents, material, geo.brushes, consumed);
+        vector<Tri> surface;
+        for (int i = 0; i < (int)bucket.second.size(); ++i)
+            if (!consumed[i])
+                surface.push_back(bucket.second[i]);
+        BuildMeshes(weld, surface, bucket.first.contents, material, geo.meshes, meshCount, vertCount, triMeshes);
+    }
+    return geo;
+}
+
+bool RecoverClosedBrushes(const vector<WeldVert>& verts, const vector<Tri>& tris, unsigned contents,
+                          const string& material, vector<BrushOut>& brushes, vector<char>& used)
+{
+    if (tris.size() < 4)
+        return false;
+    vector<int> parent(tris.size());
+    for (int i = 0; i < (int)tris.size(); ++i)
+        parent[i] = i;
+    auto find = [&](auto&& self, int x) -> int {
+        return parent[x] == x ? x : parent[x] = self(self, parent[x]);
+    };
+    struct CornerKey {
+        int x, y, z;
+        bool operator==(const CornerKey& o) const { return x == o.x && y == o.y && z == o.z; }
+    };
+    struct CornerHash {
+        size_t operator()(const CornerKey& k) const
+        {
+            return ((size_t)k.x * 73856093u) ^ ((size_t)k.y * 19349663u) ^ ((size_t)k.z * 83492791u);
+        }
+    };
+    unordered_map<CornerKey, int, CornerHash> owner;
+    for (int i = 0; i < (int)tris.size(); ++i) {
+        int ids[3] = { tris[i].a, tris[i].b, tris[i].c };
+        for (int id : ids) {
+            const Vec3& point = verts[id].p;
+            CornerKey key{ (int)llround(point.x * 100.0), (int)llround(point.y * 100.0), (int)llround(point.z * 100.0) };
+            auto found = owner.find(key);
+            if (found == owner.end())
+                owner[key] = i;
+            else {
+                int a = find(find, i);
+                int b = find(find, found->second);
+                if (a != b)
+                    parent[a] = b;
+            }
+        }
+    }
+
+    unordered_map<int, vector<int>> groups;
+    for (int i = 0; i < (int)tris.size(); ++i)
+        groups[find(find, i)].push_back(i);
+
+    bool any = false;
+    for (const auto& group : groups) {
+        const vector<int>& ids = group.second;
+        if (ids.size() < 4)
+            continue;
+
+        struct PlaneKey {
+            int x, y, z, d;
+            bool operator==(const PlaneKey& o) const { return x == o.x && y == o.y && z == o.z && d == o.d; }
+        };
+        struct PlaneKeyHash {
+            size_t operator()(const PlaneKey& k) const
+            {
+                return ((size_t)k.x * 73856093u) ^ ((size_t)k.y * 19349663u) ^ ((size_t)k.z * 83492791u) ^ ((size_t)k.d * 17u);
+            }
+        };
+        struct PlaneGroup {
+            PlaneD plane;
+            vector<int> tris;
+        };
+        unordered_map<PlaneKey, int, PlaneKeyHash> planeIndex;
+        vector<PlaneGroup> planes;
+        bool bad = false;
+        for (int ti : ids) {
+            const Vec3& a = verts[tris[ti].a].p;
+            const Vec3& b = verts[tris[ti].b].p;
+            const Vec3& c = verts[tris[ti].c].p;
+            Vec3 n = Cross(Sub(b, a), Sub(c, a));
+            double len = Len(n);
+            if (len < 1e-4) {
+                bad = true;
+                break;
+            }
+            n = Mul(n, 1.0 / len);
+            double dist = Dot(n, a);
+            PlaneKey key{ (int)llround(n.x * 200.0), (int)llround(n.y * 200.0), (int)llround(n.z * 200.0), (int)llround(dist * 4.0) };
+            auto found = planeIndex.find(key);
+            if (found == planeIndex.end()) {
+                planeIndex[key] = (int)planes.size();
+                planes.push_back({ { { n.x, n.y, n.z }, dist }, { ti } });
+            } else {
+                planes[found->second].tris.push_back(ti);
+            }
+        }
+        if (bad || planes.size() < 4 || planes.size() > 32)
+            continue;
+
+        BrushOut brush;
+        brush.contents = contents;
+        bool closed = true;
+        double bmin[3] = { 1e30, 1e30, 1e30 };
+        double bmax[3] = { -1e30, -1e30, -1e30 };
+        for (int p = 0; p < (int)planes.size(); ++p) {
+            vector<Vec3> winding = BaseWinding(planes[p].plane);
+            for (int other = 0; other < (int)planes.size() && !winding.empty(); ++other) {
+                if (other == p)
+                    continue;
+                winding = ClipWinding(winding, planes[other].plane);
+            }
+            OrientWinding(winding, planes[p].plane);
+            Vec3 tri[3];
+            if (!FacePoints(winding, planes[p].plane, tri)) {
+                closed = false;
+                break;
+            }
+            FaceOut face;
+            face.p[0] = tri[0];
+            face.p[1] = tri[1];
+            face.p[2] = tri[2];
+            face.material = material;
+            vector<Hit> hits(3);
+            int sample = planes[p].tris[0];
+            int corner[3] = { tris[sample].a, tris[sample].b, tris[sample].c };
+            for (int k = 0; k < 3; ++k) {
+                hits[k] = { verts[corner[k]].p.x, verts[corner[k]].p.y, verts[corner[k]].p.z,
+                            verts[corner[k]].st[0], verts[corner[k]].st[1] };
+            }
+            FitFace(hits, planes[p].plane, face);
+            brush.faces.push_back(face);
+            for (const Vec3& point : winding) {
+                bmin[0] = min(bmin[0], point.x); bmax[0] = max(bmax[0], point.x);
+                bmin[1] = min(bmin[1], point.y); bmax[1] = max(bmax[1], point.y);
+                bmin[2] = min(bmin[2], point.z); bmax[2] = max(bmax[2], point.z);
+            }
+        }
+        if (!closed || brush.faces.size() < 4)
+            continue;
+
+        double pmin[3] = { 1e30, 1e30, 1e30 };
+        double pmax[3] = { -1e30, -1e30, -1e30 };
+        bool inside = true;
+        for (int ti : ids) {
+            int corner[3] = { tris[ti].a, tris[ti].b, tris[ti].c };
+            for (int id : corner) {
+                const Vec3& point = verts[id].p;
+                pmin[0] = min(pmin[0], point.x); pmax[0] = max(pmax[0], point.x);
+                pmin[1] = min(pmin[1], point.y); pmax[1] = max(pmax[1], point.y);
+                pmin[2] = min(pmin[2], point.z); pmax[2] = max(pmax[2], point.z);
+                for (const PlaneGroup& plane : planes) {
+                    if (plane.plane.Dist(point) > 1.5) {
+                        inside = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!inside)
+            continue;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (bmin[axis] < pmin[axis] - 2.0 || bmax[axis] > pmax[axis] + 2.0)
+                inside = false;
+        }
+        if (!inside)
+            continue;
+
+        brushes.push_back(move(brush));
+        for (int ti : ids)
+            used[ti] = 1;
+        any = true;
+    }
+    return any;
+}
+
+void SkipSpace(const char*& p)
+{
+    while (*p && isspace((unsigned char)*p))
+        ++p;
+}
+
+bool ParseQuoted(const char*& p, string& out)
+{
+    SkipSpace(p);
+    if (*p != '"')
+        return false;
+    ++p;
+    out.clear();
+    while (*p && *p != '"') {
+        out.push_back(*p);
+        ++p;
+    }
+    if (*p != '"')
+        return false;
+    ++p;
+    return true;
+}
+
+vector<Ent> ParseEntities(const string& text)
+{
+    const char* p = text.c_str();
+    vector<Ent> ents;
+    while (true) {
+        SkipSpace(p);
+        if (!*p)
+            break;
+        if (*p != '{')
+            throw runtime_error("entity lump is not map text");
+        ++p;
+        Ent ent;
+        while (true) {
+            SkipSpace(p);
+            if (*p == '}') {
+                ++p;
+                break;
+            }
+            if (!*p)
+                throw runtime_error("entity lump ended inside an entity");
+            Pair pair;
+            if (!ParseQuoted(p, pair.key) || !ParseQuoted(p, pair.value))
+                throw runtime_error("entity lump has a broken key");
+            ent.pairs.push_back(move(pair));
+        }
+        ents.push_back(move(ent));
+    }
+    return ents;
+}
+
+string ClassName(const Ent& ent)
+{
+    for (const Pair& pair : ent.pairs)
+        if (pair.key == "classname")
+            return pair.value;
+    return {};
+}
+
+string KeyOf(const Ent& ent, const string& key)
+{
+    for (const Pair& pair : ent.pairs)
+        if (pair.key == key)
+            return pair.value;
+    return {};
+}
+
+int StarModel(const string& value)
+{
+    if (value.size() < 2 || value[0] != '*')
+        return -1;
+    char* end = nullptr;
+    long n = strtol(value.c_str() + 1, &end, 10);
+    if (!end || *end || n < 0 || n > 1000000)
+        return -1;
+    return (int)n;
+}
+
+Vec3 OriginOf(const Ent& ent)
+{
+    Vec3 origin{ 0, 0, 0 };
+    string value = KeyOf(ent, "origin");
+    if (value.empty())
+        return origin;
+    sscanf(value.c_str(), "%lf %lf %lf", &origin.x, &origin.y, &origin.z);
+    return origin;
+}
+
+bool IsLightClass(const string& name)
+{
+    return name == "light" || name.rfind("light_", 0) == 0;
+}
+
+bool IsLightTargetClass(const string& name)
+{
+    return name == "info_null" || name == "info_notnull" || name == "info_notnull_big";
+}
+
+bool DroppedClass(const string& name)
+{
+    return name == "misc_prefab" || name == "func_group" || name == "group_info" || name == "reflection_probe";
+}
+
+struct FileOut {
+    FILE* f = nullptr;
+    explicit FileOut(const fs::path& path)
+    {
+        if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f)
+            throw runtime_error("could not write " + path.string());
+    }
+    ~FileOut()
+    {
+        if (f)
+            fclose(f);
+    }
+};
+
+void WriteHeader(FILE* f)
+{
+    fputs("iwmap 4\n", f);
+    fputs("\"000_Global\" flags  active\n", f);
+    fputs("\"The Map\" flags \n", f);
+}
+
+void WritePairs(FILE* f, const Ent& ent)
+{
+    for (const Pair& pair : ent.pairs) {
+        if (pair.key == "gndLt" || pair.key == "pl#")
+            continue;
+        if ((pair.key == "model" || pair.key == "physicsmodel") && StarModel(pair.value) >= 0)
+            continue;
+        fprintf(f, "\"%s\" \"%s\"\n", pair.key.c_str(), pair.value.c_str());
+    }
+}
+
+void WriteBrush(FILE* f, int index, const BrushOut& brush)
+{
+    fprintf(f, "// brush %d\n{\n", index);
+    if (const char* contents = ContentsToken(brush.contents))
+        fprintf(f, " contents %s;\n", contents);
+    for (const FaceOut& face : brush.faces) {
+        for (int i = 0; i < 3; ++i) {
+            fputs(i ? " " : "", f);
+            fputs("( ", f);
+            WriteNum(f, face.p[i].x); fputc(' ', f);
+            WriteNum(f, face.p[i].y); fputc(' ', f);
+            WriteNum(f, face.p[i].z);
+            fputs(" )", f);
+        }
+        fprintf(f, " %s ", face.material.c_str());
+        WriteNum(f, face.scaleS); fputc(' ', f);
+        WriteNum(f, face.scaleT); fputc(' ', f);
+        WriteNum(f, face.shiftS); fputc(' ', f);
+        WriteNum(f, face.shiftT); fputc(' ', f);
+        WriteNum(f, face.rotate); fputc(' ', f);
+        WriteNum(f, face.skew);
+        fputs(" lightmap_gray 16384 16384 0 0 0 0\n", f);
+    }
+    fputs("}\n", f);
+}
+
+void WriteMesh(FILE* f, int index, const MeshOut& mesh)
+{
+    fprintf(f, "// brush %d\n{\n mesh\n {\n", index);
+    if (const char* contents = ContentsToken(mesh.contents))
+        fprintf(f, "  contents %s;\n", contents);
+    fprintf(f, "  %s\n  lightmap_gray\n  %d %d 0 1\n", mesh.material.c_str(), mesh.width, mesh.height);
+    for (int col = 0; col < mesh.width; ++col) {
+        fputs("  (\n", f);
+        for (int row = 0; row < mesh.height; ++row) {
+            const MeshVertOut& v = mesh.verts[(size_t)row * mesh.width + col];
+            fputs("   v ", f);
+            WriteNum(f, v.p.x); fputc(' ', f);
+            WriteNum(f, v.p.y); fputc(' ', f);
+            WriteNum(f, v.p.z);
+            fprintf(f, " c %u %u %u %u", v.color[2], v.color[1], v.color[0], v.color[3]);
+            fputs(" t ", f);
+            WriteNum(f, (double)v.st[0] * kPatchTexScale); fputc(' ', f);
+            WriteNum(f, (double)v.st[1] * kPatchTexScale); fputc(' ', f);
+            WriteNum(f, (double)v.lm[0] * kPatchTexScale); fputc(' ', f);
+            WriteNum(f, (double)v.lm[1] * kPatchTexScale);
+            if (v.flag)
+                fprintf(f, " f %d", v.flag);
+            fputc('\n', f);
+        }
+        fputs("  )\n", f);
+    }
+    fputs(" }\n}\n", f);
+}
+
+// cod4rad LightGrid_PointToOrigin: (index - bias) * spacing, bias 0x1000 / 0x0800.
+double GridToWorld(int index, int axis)
+{
+    if (axis == 2)
+        return (index - 0x0800) * 64.0;
+    return (index - 0x1000) * 32.0;
+}
+
+BrushOut AxisBrush(const string& material, double x0, double y0, double z0, double x1, double y1, double z1)
+{
+    BrushOut brush;
+    brush.contents = 0;
+    auto add = [&](double ax, double ay, double az, double bx, double by, double bz, double cx, double cy, double cz) {
+        FaceOut face;
+        face.material = material;
+        face.p[0] = { ax, ay, az };
+        face.p[1] = { bx, by, bz };
+        face.p[2] = { cx, cy, cz };
+        brush.faces.push_back(face);
+    };
+    add(x1, y1, z0, x0, y1, z0, x0, y0, z0);
+    add(x0, y0, z1, x0, y1, z1, x1, y1, z1);
+    add(x1, y0, z0, x0, y0, z0, x0, y0, z1);
+    add(x0, y1, z0, x1, y1, z0, x1, y1, z1);
+    add(x0, y0, z0, x0, y1, z0, x0, y1, z1);
+    add(x1, y1, z0, x1, y0, z0, x1, y0, z1);
+    return brush;
+}
+
+struct GridKey {
+    int x, y, z;
+    bool operator==(const GridKey& o) const { return x == o.x && y == o.y && z == o.z; }
+};
+
+struct GridHash {
+    size_t operator()(const GridKey& k) const
+    {
+        return ((size_t)k.x * 73856093u) ^ ((size_t)k.y * 19349663u) ^ ((size_t)k.z * 83492791u);
+    }
+};
+
+vector<GridKey> ReadGridPoints(const fs::path& path)
+{
+    vector<GridKey> points;
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"rb") != 0 || !file)
+        return points;
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    if (size <= 0 || size % 6 != 0) {
+        fclose(file);
+        return points;
+    }
+    int count = (int)(size / 6);
+    points.reserve((size_t)count);
+    for (int i = 0; i < count; ++i) {
+        unsigned short pos[3];
+        if (fread(pos, 2, 3, file) != 3)
+            break;
+        points.push_back({ (int)pos[0], (int)pos[1], (int)pos[2] });
+    }
+    fclose(file);
+    return points;
+}
+
+void AddGridVolumes(vector<BrushOut>& brushes, const vector<GridKey>& points, const string& material)
+{
+    if (points.empty())
+        return;
+    unordered_map<GridKey, int, GridHash> lookup;
+    lookup.reserve(points.size() * 2);
+    for (int i = 0; i < (int)points.size(); ++i)
+        lookup.emplace(points[i], i);
+
+    vector<int> parent(points.size());
+    for (int i = 0; i < (int)points.size(); ++i)
+        parent[i] = i;
+    auto find = [&](auto&& self, int x) -> int {
+        return parent[x] == x ? x : parent[x] = self(self, parent[x]);
+    };
+    const int step[6][3] = {
+        { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 }
+    };
+    for (int i = 0; i < (int)points.size(); ++i) {
+        for (int n = 0; n < 6; ++n) {
+            GridKey next{ points[i].x + step[n][0], points[i].y + step[n][1], points[i].z + step[n][2] };
+            auto found = lookup.find(next);
+            if (found == lookup.end())
+                continue;
+            int a = find(find, i);
+            int b = find(find, found->second);
+            if (a != b)
+                parent[a] = b;
+        }
+    }
+
+    struct Bounds {
+        int min[3];
+        int max[3];
+        bool init = false;
+    };
+    unordered_map<int, Bounds> groups;
+    for (int i = 0; i < (int)points.size(); ++i) {
+        int root = find(find, i);
+        Bounds& box = groups[root];
+        int pos[3] = { points[i].x, points[i].y, points[i].z };
+        if (!box.init) {
+            for (int axis = 0; axis < 3; ++axis)
+                box.min[axis] = box.max[axis] = pos[axis];
+            box.init = true;
+        } else {
+            for (int axis = 0; axis < 3; ++axis) {
+                box.min[axis] = min(box.min[axis], pos[axis]);
+                box.max[axis] = max(box.max[axis], pos[axis]);
+            }
+        }
+    }
+
+    for (const auto& item : groups) {
+        const Bounds& box = item.second;
+        double wmin[3];
+        double wmax[3];
+        for (int axis = 0; axis < 3; ++axis) {
+            wmin[axis] = GridToWorld(box.min[axis], axis);
+            wmax[axis] = GridToWorld(box.max[axis], axis);
+            if (box.min[axis] == box.max[axis])
+                wmax[axis] += axis == 2 ? 64.0 : 32.0;
+        }
+        brushes.push_back(AxisBrush(material, wmin[0], wmin[1], wmin[2], wmax[0], wmax[1], wmax[2]));
+    }
+}
+
+vector<BrushOut> BuildLightGridBrushes(const BspFile& bsp, const fs::path& bspPath)
+{
+    vector<BrushOut> brushes;
+    fs::path autoPath = bspPath;
+    fs::path skyPath = bspPath;
+    autoPath.replace_extension(L".grid_auto");
+    skyPath.replace_extension(L".grid_not");
+    AddGridVolumes(brushes, ReadGridPoints(autoPath), "lightgrid_volume");
+    AddGridVolumes(brushes, ReadGridPoints(skyPath), "lightgrid_sky");
+    if (!brushes.empty() || !bsp.hasLightGrid)
+        return brushes;
+
+    brushes.push_back(AxisBrush("lightgrid_volume",
+        GridToWorld(bsp.lightGridMins[0], 0),
+        GridToWorld(bsp.lightGridMins[1], 1),
+        GridToWorld(bsp.lightGridMins[2], 2),
+        GridToWorld(bsp.lightGridMaxs[0], 0),
+        GridToWorld(bsp.lightGridMaxs[1], 1),
+        GridToWorld(bsp.lightGridMaxs[2], 2)));
+    return brushes;
+}
+
+void WriteGeometry(FILE* f, int& brushIndex, const ModelGeo& geo)
+{
+    for (const BrushOut& brush : geo.brushes)
+        WriteBrush(f, brushIndex++, brush);
+    for (const MeshOut& mesh : geo.meshes)
+        WriteMesh(f, brushIndex++, mesh);
+}
+
+void WriteProbe(FILE* f, int index, const BspProbe& probe)
+{
+    char name[65] = {};
+    memcpy(name, probe.colorCorrection, 64);
+    fprintf(f, "// entity %d\n{\n\"origin\" \"", index);
+    WriteNum(f, probe.origin[0]); fputc(' ', f);
+    WriteNum(f, probe.origin[1]); fputc(' ', f);
+    WriteNum(f, probe.origin[2]);
+    fputs("\"\n", f);
+    if (name[0]) {
+        for (char* p = name; *p; ++p)
+            if (*p == '"')
+                *p = '\'';
+        fprintf(f, "\"color_correction\" \"%s\"\n", name);
+    }
+    fputs("\"classname\" \"reflection_probe\"\n}\n", f);
+}
+
+} // namespace
+
+ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
+{
+    cout << "reading " << bspPath.string() << endl;
+    BspFile bsp = LoadBsp(bspPath.wstring());
+    cout << "version " << bsp.version
+         << "  brushes " << bsp.brushes.size()
+         << "  models " << bsp.models.size()
+         << "  probes " << bsp.probes.size() << endl;
+
+    Names names;
+    int caulk = names.Intern("caulk");
+    vector<int> matName(bsp.materials.size(), caulk);
+    for (int i = 0; i < (int)bsp.materials.size(); ++i) {
+        string name = MaterialName(bsp.materials[i]);
+        if (name.empty())
+            name = "caulk";
+        matName[i] = names.Intern(name);
+    }
+
+    vector<Ent> ents = ParseEntities(bsp.entities);
+    int worldIndex = -1;
+    for (int i = 0; i < (int)ents.size(); ++i) {
+        if (ClassName(ents[i]) == "worldspawn") {
+            worldIndex = i;
+            break;
+        }
+    }
+    if (worldIndex < 0) {
+        Ent world;
+        world.pairs.push_back({ "classname", "worldspawn" });
+        ents.insert(ents.begin(), move(world));
+        worldIndex = 0;
+    }
+
+    unordered_set<string> lightTargets;
+    vector<char> geoEnt(ents.size(), 0);
+    for (int i = 0; i < (int)ents.size(); ++i) {
+        if (i == worldIndex)
+            continue;
+        string cls = ClassName(ents[i]);
+        if (cls == "misc_model" || cls == "dyn_model" || cls == "info_null")
+            geoEnt[i] = 1;
+        if (!IsLightClass(cls))
+            continue;
+        geoEnt[i] = 1;
+        string target = KeyOf(ents[i], "target");
+        if (!target.empty())
+            lightTargets.insert(target);
+    }
+    for (int i = 0; i < (int)ents.size(); ++i) {
+        if (i == worldIndex || !IsLightTargetClass(ClassName(ents[i])))
+            continue;
+        string targetname = KeyOf(ents[i], "targetname");
+        if (!targetname.empty() && lightTargets.count(targetname))
+            geoEnt[i] = 1;
+    }
+
+    vector<Vec3> origins(bsp.models.size(), Vec3{ 0, 0, 0 });
+    vector<vector<int>> entModels(ents.size());
+    vector<char> claimed(bsp.models.size(), 0);
+    if (!claimed.empty())
+        claimed[0] = 1;
+
+    auto claim = [&](int entIndex, int model) {
+        if (model <= 0 || model >= (int)bsp.models.size() || claimed[model])
+            return;
+        claimed[model] = 1;
+        origins[model] = OriginOf(ents[entIndex]);
+        entModels[entIndex].push_back(model);
+    };
+
+    for (int i = 0; i < (int)ents.size(); ++i) {
+        if (i == worldIndex || DroppedClass(ClassName(ents[i])))
+            continue;
+        claim(i, StarModel(KeyOf(ents[i], "model")));
+        claim(i, StarModel(KeyOf(ents[i], "physicsmodel")));
+    }
+
+    vector<int> orphans;
+    for (int m = 1; m < (int)bsp.models.size(); ++m)
+        if (!claimed[m])
+            orphans.push_back(m);
+
+    ExportStats stats;
+    stats.version = bsp.version;
+    stats.probes = (int)bsp.probes.size();
+    if (!orphans.empty())
+        stats.warning = "unreferenced brush models were merged into the geo map";
+
+    vector<ModelGeo> models(bsp.models.size());
+    for (int m = 0; m < (int)bsp.models.size(); ++m) {
+        cout << "model " << m << "/" << bsp.models.size() << endl;
+        models[m] = BuildModel(bsp, m, origins[m], matName, names, caulk,
+                               stats.droppedBrushes, stats.meshes, stats.meshVerts, stats.triangleMeshes);
+    }
+
+    ModelGeo world = move(models[0]);
+    for (int m : orphans) {
+        for (BrushOut& brush : models[m].brushes)
+            world.brushes.push_back(move(brush));
+        for (MeshOut& mesh : models[m].meshes)
+            world.meshes.push_back(move(mesh));
+    }
+    for (BrushOut& brush : BuildLightGridBrushes(bsp, bspPath))
+        world.brushes.push_back(move(brush));
+    stats.probes = (int)bsp.probes.size();
+    stats.worldBrushes = (int)world.brushes.size();
+    for (int i = 0; i < (int)ents.size(); ++i)
+        for (int m : entModels[i])
+            stats.entityBrushes += (int)models[m].brushes.size();
+
+    fs::path dir = exeDir / "export" / bspPath.stem();
+    fs::create_directories(dir);
+    fs::path geoPath = dir / (bspPath.stem().wstring() + L"_geo.map");
+    fs::path entPath = dir / (bspPath.stem().wstring() + L".map");
+    string prefabName = geoPath.filename().string();
+
+    {
+        FileOut geo(geoPath);
+        WriteHeader(geo.f);
+        int entIndex = 0;
+        int brushIndex = 0;
+        fprintf(geo.f, "// entity %d\n{\n", entIndex++);
+        WritePairs(geo.f, ents[worldIndex]);
+        WriteGeometry(geo.f, brushIndex, world);
+        fputs("}\n", geo.f);
+
+        for (const BspProbe& probe : bsp.probes)
+            WriteProbe(geo.f, entIndex++, probe);
+        stats.geoEntities = (int)bsp.probes.size();
+
+        for (int i = 0; i < (int)ents.size(); ++i) {
+            if (!geoEnt[i])
+                continue;
+            fprintf(geo.f, "// entity %d\n{\n", entIndex++);
+            WritePairs(geo.f, ents[i]);
+            brushIndex = 0;
+            for (int m : entModels[i])
+                WriteGeometry(geo.f, brushIndex, models[m]);
+            fputs("}\n", geo.f);
+            stats.geoEntities++;
+        }
+    }
+
+    {
+        FileOut ent(entPath);
+        WriteHeader(ent.f);
+        int entIndex = 0;
+        fprintf(ent.f, "// entity %d\n{\n", entIndex++);
+        WritePairs(ent.f, ents[worldIndex]);
+        fputs("}\n", ent.f);
+        fprintf(ent.f, "// entity %d\n{\n", entIndex++);
+        fprintf(ent.f, "\"model\" \"%s\"\n", prefabName.c_str());
+        fputs("\"origin\" \"0 0 0\"\n", ent.f);
+        fputs("\"angles\" \"0 0 0\"\n", ent.f);
+        fputs("\"classname\" \"misc_prefab\"\n}\n", ent.f);
+
+        for (int i = 0; i < (int)ents.size(); ++i) {
+            if (i == worldIndex || geoEnt[i] || DroppedClass(ClassName(ents[i])))
+                continue;
+            fprintf(ent.f, "// entity %d\n{\n", entIndex++);
+            WritePairs(ent.f, ents[i]);
+            int brushIndex = 0;
+            for (int m : entModels[i])
+                WriteGeometry(ent.f, brushIndex, models[m]);
+            fputs("}\n", ent.f);
+            stats.entEntities++;
+        }
+    }
+
+    cout << "wrote " << geoPath.string() << endl;
+    cout << "wrote " << entPath.string() << endl;
+    return stats;
+}
