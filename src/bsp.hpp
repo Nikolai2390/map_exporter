@@ -18,6 +18,12 @@ enum BspLump : int {
     kLumpTriangles = 9,
     kLumpDrawVerts = 10,
     kLumpDrawIndices = 11,
+    kLumpPortalVerts = 19,
+    kLumpPortals = 26,
+    kLumpLeafs = 28,
+    kLumpCollisionVerts = 31,
+    kLumpCollisionTris = 32,
+    kLumpCollisionPartitions = 35,
     kLumpCollisionAabbs = 36,
     kLumpModels = 37,
     kLumpEntities = 39,
@@ -29,6 +35,7 @@ enum BspLump : int {
     kLumpSimpleDrawIndices = 49
 };
 
+static constexpr int kContentsSolid = 0x00000001;
 static constexpr int kContentsDetail = 0x08000000;
 static constexpr int kContentsNonColliding = 0x00000004;
 static constexpr int kContentsMissileClip = 0x00000080;
@@ -102,6 +109,27 @@ struct BspCollisionAabb {
 };
 static_assert(sizeof(BspCollisionAabb) == 32, "collision aabb");
 
+struct BspCollisionVert {
+    float xyz[3];
+};
+
+struct BspCollisionTri {
+    unsigned short v[3];
+};
+
+struct BspCollisionPart {
+    unsigned short checkStamp;
+    unsigned char triCount;
+    unsigned char borderCount;
+    int firstTri;
+    int firstBorder;
+};
+
+struct BspLeafColl {
+    int firstCollAabb = 0;
+    int collCount = 0;
+};
+
 struct BspProbe {
     float origin[3];
     char colorCorrection[64];
@@ -118,12 +146,24 @@ struct BspPrimaryLight {
     float radius;
     float cosHalfFovOuter;
     float cosHalfFovInner;
-    float cosHalfFovExpanded;
+    int coneExponent;
     float rotationLimit;
     float translationLimit;
     char defName[64];
 };
 static_assert(sizeof(BspPrimaryLight) == 128, "primary light");
+
+// R_LoadPortals: 16 bytes. plane index, cell index, first portal vert, vert count.
+struct BspPortal {
+    int planeIndex;
+    int cellIndex;
+    int firstVert;
+    int vertCount;
+};
+
+struct BspPortalVert {
+    float xyz[3];
+};
 
 struct BspFile {
     int version = 0;
@@ -138,6 +178,12 @@ struct BspFile {
     vector<unsigned short> indices[2];
     vector<BspModel> models;
     vector<BspCollisionAabb> collisionAabbs;
+    vector<BspCollisionVert> collisionVerts;
+    vector<BspCollisionTri> collisionTris;
+    vector<BspCollisionPart> collisionParts;
+    vector<BspLeafColl> leafColl;
+    vector<BspPortalVert> portalVerts;
+    vector<BspPortal> portals;
     string entities;
     vector<BspProbe> probes;
     vector<BspPrimaryLight> primaryLights;

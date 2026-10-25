@@ -35,6 +35,7 @@ struct FaceOut {
 
 struct BrushOut {
     unsigned contents = 0;
+    bool portal = false;
     vector<FaceOut> faces;
 };
 
@@ -156,10 +157,18 @@ void WriteNum(FILE* f, double v)
     fputs(buf, f);
 }
 
+bool IsWeaponClipFlags(unsigned flags)
+{
+    // ParseRawBrush clears SOLID and DETAIL, then sets both clip bits, for the
+    // weaponClip contents line. SetBrushContents may put DETAIL back on a
+    // translucent material. SOLID stays clear.
+    const unsigned clips = (unsigned)kContentsClipShot | (unsigned)kContentsMissileClip;
+    return (flags & clips) == clips && (flags & (unsigned)kContentsSolid) == 0;
+}
+
 const char* ContentsToken(unsigned flags)
 {
-    const unsigned weapon = (unsigned)kContentsDetail | (unsigned)kContentsClipShot | (unsigned)kContentsMissileClip;
-    if ((flags & weapon) == weapon)
+    if (IsWeaponClipFlags(flags))
         return "weaponClip";
     if (flags & (unsigned)kContentsNonColliding)
         return "nonColliding";
@@ -369,6 +378,59 @@ bool PlaneFromFacePoints(const float p0[3], const float p1[3], const float p2[3]
     out[2] = n[2] / len;
     out[3] = FloatDot(p0, out);
     SnapFloatPlane(out);
+    return true;
+}
+
+// Tris_PickBestTriangle: every triple of the side winding, largest area along
+// the face normal. Those three winding vertices are the map face.
+bool PickFaceFromWinding(const vector<Vec3>& winding, const PlaneD& plane, Vec3 out[3])
+{
+    const int n = (int)winding.size();
+    if (n < 3)
+        return false;
+    float src[4] = { (float)plane.n[0], (float)plane.n[1], (float)plane.n[2], (float)plane.dist };
+    double bestArea = 0;
+    bool found = false;
+    Vec3 best[3];
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            for (int k = j + 1; k < n; ++k) {
+                Vec3 tri[3] = { winding[i], winding[j], winding[k] };
+                Vec3 cr = Cross(Sub(tri[1], tri[0]), Sub(tri[2], tri[0]));
+                double along = Dot(cr, Vec3{ plane.n[0], plane.n[1], plane.n[2] });
+                if (along < 0) {
+                    swap(tri[1], tri[2]);
+                    along = -along;
+                }
+                if (along <= bestArea)
+                    continue;
+                float p0[3], p1[3], p2[3], recovered[4];
+                LoadFacePoint(tri[0], p0);
+                LoadFacePoint(tri[1], p1);
+                LoadFacePoint(tri[2], p2);
+                if (!PlaneFromFacePoints(p0, p1, p2, recovered))
+                    continue;
+                if (FloatDot(recovered, src) < 0.999f)
+                    continue;
+                float distTol = 0.01f;
+                float scaled = fabsf(src[3]) * 0.00001f;
+                if (scaled > distTol)
+                    distTol = scaled;
+                if (fabsf(recovered[3] - src[3]) > distTol)
+                    continue;
+                bestArea = along;
+                best[0] = tri[0];
+                best[1] = tri[1];
+                best[2] = tri[2];
+                found = true;
+            }
+        }
+    }
+    if (!found)
+        return false;
+    out[0] = best[0];
+    out[1] = best[1];
+    out[2] = best[2];
     return true;
 }
 
@@ -800,8 +862,14 @@ void FitBrushPlanes(vector<FaceOut>& faces, const vector<PlaneD>& sourcePlanes, 
 
     vector<Vec3> bestPoints = capture();
     PlaneHit best = AuditFacePlanes(faces);
+    // The winding corners already reproduce the planes. Replacing them with a
+    // multi-thousand-unit triangle survives the in-memory check and then
+    // shifts when the map text is parsed, so portal volumes disappear.
+    if (best.slack >= 0.04f)
+        return;
+    float brushSpan = (float)max(extent, 16.0);
     if (snapped) {
-        ApplyPlanePoints(faces, planes, onPlane, 4096.f, 0.f);
+        ApplyPlanePoints(faces, planes, onPlane, brushSpan, 0.f);
         PlaneHit hit = AuditFacePlanes(faces);
         if (hit.slack >= best.slack) {
             best = hit;
@@ -812,9 +880,9 @@ void FitBrushPlanes(vector<FaceOut>& faces, const vector<PlaneD>& sourcePlanes, 
     if (best.slack >= 0.04f)
         return;
 
-    const float spans[] = { 1024.f, 2048.f, 3072.f, 4096.f, 6144.f, 8192.f, 12288.f };
+    const float spans[] = { brushSpan * 0.5f, brushSpan, brushSpan * 2.f };
     const float spins[] = { 0.f, 0.2f, 0.45f, 0.7f, 1.0f, 1.4f, 1.9f, 2.4f };
-    float useSpan = 4096.f;
+    float useSpan = brushSpan;
     float useSpin = 0.f;
     for (float span : spans) {
         for (float spin : spins) {
@@ -972,61 +1040,6 @@ double MinorSpan(const vector<Vec3>& winding, const PlaneD& plane)
     return min(maxU - minU, maxV - minV);
 }
 
-double WindingArea(const vector<Vec3>& winding, const PlaneD& plane)
-{
-    if (winding.size() < 3)
-        return 0;
-    Vec3 n = { plane.n[0], plane.n[1], plane.n[2] };
-    Vec3 area{ 0, 0, 0 };
-    for (size_t i = 1; i + 1 < winding.size(); ++i)
-        area = Add(area, Cross(Sub(winding[i], winding[0]), Sub(winding[i + 1], winding[0])));
-    return fabs(Dot(area, n)) * 0.5;
-}
-
-bool IsAxialPlane(const PlaneD& p, double eps = 1e-3)
-{
-    int nonzero = 0;
-    bool unit = false;
-    for (int i = 0; i < 3; ++i) {
-        if (fabs(p.n[i]) > eps)
-            ++nonzero;
-        if (fabs(fabs(p.n[i]) - 1.0) < eps)
-            unit = true;
-    }
-    return nonzero == 1 && unit;
-}
-
-PlaneD NegatePlane(const PlaneD& p)
-{
-    return { { -p.n[0], -p.n[1], -p.n[2] }, -p.dist };
-}
-
-bool SamePlane(const PlaneD& a, const PlaneD& b, double nEps = 0.02, double dEps = 1.0)
-{
-    return fabs(a.n[0] - b.n[0]) < nEps && fabs(a.n[1] - b.n[1]) < nEps
-        && fabs(a.n[2] - b.n[2]) < nEps && fabs(a.dist - b.dist) < dEps;
-}
-
-constexpr double kEdgeLength = 0.2;
-
-bool WindingIsTiny(const vector<Vec3>& w)
-{
-    if (w.size() < 3)
-        return true;
-    int edgeCount = 0;
-    for (size_t i = 0, j = w.size() - 1; i < w.size(); j = i, ++i) {
-        const double dx = w[i].x - w[j].x;
-        const double dy = w[i].y - w[j].y;
-        const double dz = w[i].z - w[j].z;
-        if (dx * dx + dy * dy + dz * dz > kEdgeLength * kEdgeLength) {
-            ++edgeCount;
-            if (edgeCount == 3)
-                return false;
-        }
-    }
-    return true;
-}
-
 bool Solve3(const double m[3][3], const double b[3], double x[3]);
 
 bool IntersectPlanes(const PlaneD& a, const PlaneD& b, const PlaneD& c, Vec3& out)
@@ -1042,134 +1055,6 @@ bool IntersectPlanes(const PlaneD& a, const PlaneD& b, const PlaneD& c, Vec3& ou
         return false;
     out = { x[0], x[1], x[2] };
     return true;
-}
-
-vector<Vec3> HullPoints(const vector<PlaneD>& planes, double eps = 0.05)
-{
-    vector<Vec3> verts;
-    const int n = (int)planes.size();
-    for (int i = 0; i < n; ++i) {
-        for (int j = i + 1; j < n; ++j) {
-            for (int k = j + 1; k < n; ++k) {
-                Vec3 pt;
-                if (!IntersectPlanes(planes[i], planes[j], planes[k], pt))
-                    continue;
-                bool inside = true;
-                for (const PlaneD& p : planes) {
-                    if (p.Dist(pt) > eps) {
-                        inside = false;
-                        break;
-                    }
-                }
-                if (inside)
-                    verts.push_back(pt);
-            }
-        }
-    }
-    return verts;
-}
-
-vector<PlaneD> KeepAreaPlanes(const vector<PlaneD>& planes)
-{
-    vector<PlaneD> kept;
-    for (int i = 0; i < (int)planes.size(); ++i) {
-        vector<Vec3> winding = BaseWinding(planes[i]);
-        for (int j = 0; j < (int)planes.size() && !winding.empty(); ++j) {
-            if (j == i)
-                continue;
-            winding = ClipWinding(winding, planes[j]);
-        }
-        OrientWinding(winding, planes[i]);
-        if (!WindingIsTiny(winding))
-            kept.push_back(planes[i]);
-    }
-    return kept;
-}
-
-vector<PlaneD> RecoverPortalPlanes(const vector<PlaneD>& planes, const vector<PlaneD>& neighborPlanes)
-{
-    vector<PlaneD> trial = KeepAreaPlanes(planes);
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        vector<Vec3> verts = HullPoints(trial);
-        if (verts.empty())
-            break;
-        Vec3 centroid{ 0, 0, 0 };
-        for (const Vec3& v : verts)
-            centroid = Add(centroid, v);
-        centroid = Mul(centroid, 1.0 / (double)verts.size());
-
-        vector<int> axialIdx;
-        for (int i = 0; i < (int)trial.size(); ++i) {
-            if (IsAxialPlane(trial[i]))
-                axialIdx.push_back(i);
-        }
-        if (axialIdx.empty())
-            break;
-
-        int bestKilled = 0;
-        double bestArea = -1;
-        PlaneD bestCand{};
-        bool have = false;
-
-        auto consider = [&](const PlaneD& cand) {
-            if (IsAxialPlane(cand))
-                return;
-            for (const PlaneD& p : trial) {
-                if (SamePlane(cand, p) || SamePlane(NegatePlane(cand), p))
-                    return;
-            }
-            if (cand.Dist(centroid) > 0.1)
-                return;
-            int onHull = 0;
-            for (const Vec3& v : verts) {
-                if (fabs(cand.Dist(v)) <= 0.5)
-                    ++onHull;
-            }
-            if (onHull < 2)
-                return;
-            vector<PlaneD> neu = trial;
-            neu.push_back(cand);
-            vector<Vec3> winding = BaseWinding(cand);
-            for (int j = 0; j < (int)neu.size() - 1 && !winding.empty(); ++j)
-                winding = ClipWinding(winding, neu[j]);
-            OrientWinding(winding, cand);
-            if (WindingIsTiny(winding))
-                return;
-            double area = WindingArea(winding, cand);
-            int killed = 0;
-            for (int ai : axialIdx) {
-                vector<Vec3> aw = BaseWinding(neu[ai]);
-                for (int j = 0; j < (int)neu.size() && !aw.empty(); ++j) {
-                    if (j == ai)
-                        continue;
-                    aw = ClipWinding(aw, neu[j]);
-                }
-                if (WindingIsTiny(aw))
-                    ++killed;
-            }
-            if (killed <= 0)
-                return;
-            if (!have || killed > bestKilled || (killed == bestKilled && area > bestArea)) {
-                have = true;
-                bestKilled = killed;
-                bestArea = area;
-                bestCand = cand;
-            }
-        };
-
-        for (const PlaneD& raw : neighborPlanes) {
-            consider(raw);
-            consider(NegatePlane(raw));
-        }
-        if (have) {
-            trial.push_back(bestCand);
-            trial = KeepAreaPlanes(trial);
-            changed = true;
-        }
-    }
-    return trial;
 }
 
 bool InsideConvex(const vector<Vec3>& w, const Vec3& p, const Vec3& n, double slop)
@@ -1425,159 +1310,6 @@ struct BuiltSides {
     vector<SideGeom> sides;
 };
 
-bool EmitFacesFromPlanes(const vector<PlaneD>& planes, const string& material, int nameId,
-                         unsigned surfaceFlags, BrushOut& brush, BuiltSides& sides)
-{
-    brush.faces.clear();
-    sides.sides.clear();
-    for (int i = 0; i < (int)planes.size(); ++i) {
-        vector<Vec3> winding = BaseWinding(planes[i]);
-        for (int j = 0; j < (int)planes.size() && !winding.empty(); ++j) {
-            if (j == i)
-                continue;
-            winding = ClipWinding(winding, planes[j]);
-        }
-        OrientWinding(winding, planes[i]);
-        if (WindingIsTiny(winding))
-            continue;
-        Vec3 tri[3];
-        if (!FacePoints(winding, planes[i], tri))
-            continue;
-        FaceOut face;
-        face.p[0] = tri[0];
-        face.p[1] = tri[1];
-        face.p[2] = tri[2];
-        face.material = material;
-        brush.faces.push_back(face);
-        SideGeom side;
-        side.nameId = nameId;
-        side.surfaceFlags = surfaceFlags;
-        side.plane = planes[i];
-        side.faceIndex = (int)brush.faces.size() - 1;
-        BoundsOf(winding, side.mins, side.maxs);
-        side.winding = move(winding);
-        sides.sides.push_back(move(side));
-    }
-    float solidSlack = 0.f;
-    return BrushSolidPoints(brush.faces, &solidSlack) >= 4 && solidSlack >= 0.04f;
-}
-
-void RecoverPortalBrushes(vector<BrushOut>& brushes, vector<SideGeom>& allSides,
-                          vector<int>& brushSideStart, const Names& names, int caulk)
-{
-    const int n = (int)brushes.size();
-    if (n == 0)
-        return;
-
-    vector<vector<PlaneD>> planes(n);
-    vector<char> isPortal(n, 0);
-    vector<int> portalNameId(n, caulk);
-    vector<string> portalMat(n);
-    vector<unsigned> portalFlags(n, kSurfPortal);
-
-    for (int b = 0; b < n; ++b) {
-        int begin = brushSideStart[b];
-        int end = brushSideStart[b + 1];
-        if (caulk >= 0 && caulk < (int)names.list.size())
-            portalMat[b] = names.list[caulk];
-        for (int i = begin; i < end; ++i) {
-            planes[b].push_back(allSides[i].plane);
-            if (SideIsPortal(allSides[i].surfaceFlags)) {
-                isPortal[b] = 1;
-                portalNameId[b] = allSides[i].nameId;
-                portalFlags[b] = allSides[i].surfaceFlags;
-                int fi = allSides[i].faceIndex;
-                if (fi >= 0 && fi < (int)brushes[b].faces.size())
-                    portalMat[b] = brushes[b].faces[fi].material;
-            }
-        }
-    }
-
-    bool any = false;
-    vector<BuiltSides> rebuilt(n);
-    vector<char> changed(n, 0);
-    for (int b = 0; b < n; ++b) {
-        if (!isPortal[b])
-            continue;
-        vector<PlaneD> neighbors;
-        for (int o = 0; o < n; ++o) {
-            if (o == b || !isPortal[o])
-                continue;
-            int begin = brushSideStart[o];
-            int end = brushSideStart[o + 1];
-            for (int s = begin; s < end; ++s) {
-                if (IsAxialPlane(allSides[s].plane))
-                    continue;
-                neighbors.push_back(allSides[s].plane);
-            }
-        }
-        if (neighbors.empty())
-            continue;
-        vector<PlaneD> recovered = RecoverPortalPlanes(planes[b], neighbors);
-        if (recovered.size() == planes[b].size()) {
-            bool same = true;
-            for (size_t i = 0; i < recovered.size() && same; ++i) {
-                bool found = false;
-                for (const PlaneD& p : planes[b]) {
-                    if (SamePlane(recovered[i], p)) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found)
-                    same = false;
-            }
-            if (same)
-                continue;
-        }
-        BrushOut trial = brushes[b];
-        BuiltSides trialSides;
-        if (!EmitFacesFromPlanes(recovered, portalMat[b], portalNameId[b], portalFlags[b], trial, trialSides))
-            continue;
-        for (size_t i = 0; i < trialSides.sides.size(); ++i) {
-            for (size_t j = 0; j < planes[b].size(); ++j) {
-                if (!SamePlane(trialSides.sides[i].plane, planes[b][j]))
-                    continue;
-                int begin = brushSideStart[b];
-                int end = brushSideStart[b + 1];
-                for (int s = begin; s < end; ++s) {
-                    if (!SamePlane(allSides[s].plane, planes[b][j]))
-                        continue;
-                    trialSides.sides[i].nameId = allSides[s].nameId;
-                    trialSides.sides[i].surfaceFlags = allSides[s].surfaceFlags;
-                    int oldFace = allSides[s].faceIndex;
-                    if (oldFace >= 0 && oldFace < (int)brushes[b].faces.size())
-                        trial.faces[i].material = brushes[b].faces[oldFace].material;
-                    break;
-                }
-                break;
-            }
-        }
-        brushes[b] = move(trial);
-        rebuilt[b] = move(trialSides);
-        changed[b] = 1;
-        any = true;
-    }
-    if (!any)
-        return;
-
-    vector<SideGeom> neu;
-    vector<int> neuStart;
-    neuStart.push_back(0);
-    for (int b = 0; b < n; ++b) {
-        if (changed[b]) {
-            for (SideGeom& s : rebuilt[b].sides)
-                neu.push_back(move(s));
-        } else {
-            for (int i = brushSideStart[b]; i < brushSideStart[b + 1]; ++i)
-                neu.push_back(move(allSides[i]));
-        }
-        neuStart.push_back((int)neu.size());
-    }
-    allSides = move(neu);
-    brushSideStart = move(neuStart);
-}
-
 static int gDropSides = 0;
 static int gDropMat = 0;
 static int gDropPlane = 0;
@@ -1642,12 +1374,15 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
             continue;
 
         Vec3 tri[3];
-        if (!FacePoints(winding, planes[local], tri)) {
+        if (!PickFaceFromWinding(winding, planes[local], tri) && !FacePoints(winding, planes[local], tri)) {
             Vec3 anchor{ 0, 0, 0 };
             for (const Vec3& p : winding)
                 anchor = Add(anchor, p);
             anchor = Mul(anchor, 1.0 / (double)winding.size());
-            if (!PointsOnPlane(planes[local], anchor, 4096.f, 0.f, tri))
+            double span = 16;
+            for (const Vec3& p : winding)
+                span = max(span, Len(Sub(p, anchor)));
+            if (!PointsOnPlane(planes[local], anchor, (float)span, 0.f, tri))
                 continue;
         }
 
@@ -1685,7 +1420,8 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
         if (SideIsVisibleSolid(sides.sides[i].surfaceFlags))
             hasVisibleSolid = true;
     }
-    const bool portalBrush = hasPortalBit && !hasVisibleSolid;
+    const bool portalBrush = hasPortalBit;
+    brush.portal = portalBrush;
     if (!portalBrush) {
         string caulkName = (caulk >= 0 && caulk < (int)names.list.size()) ? names.list[caulk] : string("caulk");
         for (size_t i = 0; i < brush.faces.size(); ++i) {
@@ -1696,8 +1432,7 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
             sides.sides[i].nameId = caulk;
             sides.sides[i].surfaceFlags = kSurfNodraw;
         }
-    } else {
-        brush.contents &= ~(unsigned)kContentsDetail;
+    } else if (!hasVisibleSolid) {
         int portalNodraw = caulk;
         auto pn = names.lookup.find("portal_nodraw");
         if (pn != names.lookup.end())
@@ -1712,7 +1447,7 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
         }
     }
 
-    if (brush.faces.size() >= 4 && brush.faces.size() == sides.sides.size()) {
+    if (!portalBrush && brush.faces.size() >= 4 && brush.faces.size() == sides.sides.size()) {
         vector<PlaneD> fitPlanes;
         vector<Vec3> fitAnchors;
         fitPlanes.reserve(brush.faces.size());
@@ -1729,17 +1464,21 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
             }
             fitAnchors.push_back(anchor);
         }
-        FitBrushPlanes(brush.faces, fitPlanes, fitAnchors);
+        float woundSlack = 0.f;
+        if (BrushSolidPoints(brush.faces, &woundSlack) < 4 || woundSlack < 0.04f)
+            FitBrushPlanes(brush.faces, fitPlanes, fitAnchors);
     }
 
     if (brush.faces.size() < 4) {
         ++gDropFaces;
         return false;
     }
-    float solidSlack = 0.f;
-    if (BrushSolidPoints(brush.faces, &solidSlack) < 4 || solidSlack < 0.04f) {
-        ++gDropSolid;
-        return false;
+    if (!portalBrush) {
+        float solidSlack = 0.f;
+        if (BrushSolidPoints(brush.faces, &solidSlack) < 4 || solidSlack < 0.04f) {
+            ++gDropSolid;
+            return false;
+        }
     }
     return true;
 }
@@ -1754,7 +1493,11 @@ template <typename Fn>
 void ForSoups(const BspFile& bsp, int model, Fn&& fn)
 {
     const BspModel& mdl = bsp.models[model];
-    for (int type = 0; type < 2; ++type) {
+    // Simple (1) keeps the mesh vertex color and alpha. Layered (0) stores
+    // blend weights in those bytes. Walking simple first keeps the color when
+    // both soups contain the same triangle.
+    const int soupOrder[2] = { 1, 0 };
+    for (int type : soupOrder) {
         int first = mdl.firstTriSoup[type];
         int count = mdl.triSoupCount[type];
         if (count == 0)
@@ -1981,37 +1724,46 @@ void FitAllBrushTextures(const BspFile& bsp, int model, const Vec3& origin, cons
     }
 }
 
-bool TriangleOnSide(const SideGeom& side, const Vec3& a, const Vec3& b, const Vec3& c)
+bool SameCompiledPoint(const Vec3& a, const Vec3& b)
 {
-    if (fabs(side.plane.Dist(a)) > 1.0 || fabs(side.plane.Dist(b)) > 1.0 || fabs(side.plane.Dist(c)) > 1.0)
-        return false;
-    if (!BoundsOverlap(side.mins, side.maxs, a, b, c, 8.0))
-        return false;
-    Vec3 n = { side.plane.n[0], side.plane.n[1], side.plane.n[2] };
-    Vec3 mid = Mul(Add(Add(a, b), c), 1.0 / 3.0);
-    return InsideConvex(side.winding, mid, n, 8.0);
+    // com_vector.h VEC_EPSILON. Per component, same as Vec3Equal.
+    return fabs(a.x - b.x) <= 0.001 && fabs(a.y - b.y) <= 0.001 && fabs(a.z - b.z) <= 0.001;
 }
 
-struct WeldKey {
-    long long x, y, z, s, t, color;
-    bool operator==(const WeldKey& o) const
-    {
-        return x == o.x && y == o.y && z == o.z && s == o.s && t == o.t && color == o.color;
-    }
-};
+// tris.cpp TRIS_ON_EPSILON. Brush-face draw vertices lie on the side plane by this much.
+constexpr double kTrisOnEpsilon = 0.1;
 
-struct WeldHash {
-    size_t operator()(const WeldKey& k) const
-    {
-        size_t h = (size_t)k.x * 73856093u;
-        h ^= (size_t)k.y * 19349663u;
-        h ^= (size_t)k.z * 83492791u;
-        h ^= (size_t)k.s * 83492791u;
-        h ^= (size_t)k.t * 19349663u;
-        h ^= (size_t)k.color * 19349663u;
-        return h;
-    }
-};
+bool PointInsideSide(const SideGeom& side, const Vec3& p)
+{
+    if (fabs(side.plane.Dist(p)) > kTrisOnEpsilon)
+        return false;
+    Vec3 n = { side.plane.n[0], side.plane.n[1], side.plane.n[2] };
+    return InsideConvex(side.winding, p, n, kTrisOnEpsilon);
+}
+
+// Drop a draw triangle only when one brush side of this material covers the
+// whole triangle, including its centroid. A triangle that merely puts its
+// corners on neighboring sides still spans the gap between those sides.
+bool VerticesOnBrushSides(SideGrid& grid, const vector<SideGeom>& sides, int nameId,
+                          const Vec3& a, const Vec3& b, const Vec3& c)
+{
+    Vec3 mid = Mul(Add(Add(a, b), c), 1.0 / 3.0);
+    bool covered = false;
+    grid.query(a, b, c, [&](int sideIndex) {
+        if (covered || sides[sideIndex].nameId != nameId)
+            return;
+        const SideGeom& side = sides[sideIndex];
+        if (PointInsideSide(side, a) && PointInsideSide(side, b) && PointInsideSide(side, c)
+            && PointInsideSide(side, mid))
+            covered = true;
+    });
+    return covered;
+}
+
+// FindSharedVertex: VEC_EPSILON on xyz, PATCH_ST_EPSILON on st. The BSP vertex
+// is already the compiled position, so it is kept as stored.
+constexpr double kPatchWeld = 0.001;
+constexpr double kPatchSt = 1e-5;
 
 struct TriKey {
     int a, b, c;
@@ -2608,112 +2360,96 @@ bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& v
     coord[cells[0].D] = { 0, 1 };
     placed[0] = 1;
 
-    unordered_map<int, vector<int>> vertCells;
-    vertCells.reserve(cells.size() * 2);
+    map<pair<int, int>, vector<pair<int, int>>> edgeCells;
     for (int i = 0; i < (int)cells.size(); ++i) {
         int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
-        for (int k = 0; k < 4; ++k)
-            vertCells[id[k]].push_back(i);
+        for (int e = 0; e < 4; ++e) {
+            int a = id[e];
+            int b = id[(e + 1) % 4];
+            if (a > b)
+                swap(a, b);
+            edgeCells[{ a, b }].push_back({ i, e });
+        }
     }
-    vector<char> queued(cells.size(), 0);
     queue<int> pending;
-    auto touch = [&](int cellIndex) {
-        if (placed[cellIndex] || queued[cellIndex])
-            return;
-        queued[cellIndex] = 1;
-        pending.push(cellIndex);
-    };
-    auto tryPlace = [&](int i) -> bool {
-        int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
-        int lu[4] = { 0, 1, 1, 0 };
-        int lv[4] = { 0, 0, 1, 1 };
-        int known[4], nKnown = 0;
-        for (int k = 0; k < 4; ++k)
-            if (coord.find(id[k]) != coord.end())
-                known[nKnown++] = k;
-        if (nKnown < 2)
-            return false;
-
-        bool fitted = false;
-        int originU = 0, originV = 0;
-        int useMirror = 0, useRot = 0;
-        for (int mirror = 0; mirror < 2 && !fitted; ++mirror) {
-            for (int rot = 0; rot < 4 && !fitted; ++rot) {
-                auto xform = [&](int u, int v, int& ou, int& ov) {
-                    if (mirror)
-                        u = -u;
-                    for (int r = 0; r < rot; ++r) {
-                        int tmp = u;
-                        u = -v;
-                        v = tmp;
-                    }
-                    ou = u;
-                    ov = v;
-                };
-                int aU, aV, bU, bV;
-                xform(lu[known[0]], lv[known[0]], aU, aV);
-                xform(lu[known[1]], lv[known[1]], bU, bV);
-                int du = coord[id[known[1]]].u - coord[id[known[0]]].u;
-                int dv = coord[id[known[1]]].v - coord[id[known[0]]].v;
-                if (bU - aU != du || bV - aV != dv)
-                    continue;
-                originU = coord[id[known[0]]].u - aU;
-                originV = coord[id[known[0]]].v - aV;
-                fitted = true;
-                for (int k = 0; k < nKnown; ++k) {
-                    int ou, ov;
-                    xform(lu[known[k]], lv[known[k]], ou, ov);
-                    if (coord[id[known[k]]].u != originU + ou || coord[id[known[k]]].v != originV + ov)
-                        fitted = false;
-                }
-                if (fitted) {
-                    useMirror = mirror;
-                    useRot = rot;
-                }
-            }
-        }
-        if (!fitted)
-            return false;
-
-        auto xform = [&](int u, int v, int& ou, int& ov) {
-            if (useMirror)
-                u = -u;
-            for (int r = 0; r < useRot; ++r) {
-                int tmp = u;
-                u = -v;
-                v = tmp;
-            }
-            ou = u;
-            ov = v;
-        };
-        GV next[4];
-        for (int k = 0; k < 4; ++k) {
-            int ou, ov;
-            xform(lu[k], lv[k], ou, ov);
-            next[k] = { originU + ou, originV + ov };
-            auto found = coord.find(id[k]);
-            if (found != coord.end() && (found->second.u != next[k].u || found->second.v != next[k].v))
-                return false;
-        }
-        for (int k = 0; k < 4; ++k)
-            coord[id[k]] = next[k];
-        placed[i] = 1;
-        return true;
-    };
-    for (int id : { cells[0].A, cells[0].B, cells[0].C, cells[0].D })
-        for (int other : vertCells[id])
-            touch(other);
+    pending.push(0);
     while (!pending.empty()) {
         int i = pending.front();
         pending.pop();
-        queued[i] = 0;
-        if (placed[i])
+        int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
+        int cu[4], cv[4];
+        bool have = true;
+        for (int k = 0; k < 4; ++k) {
+            auto at = coord.find(id[k]);
+            if (at == coord.end()) {
+                have = false;
+                break;
+            }
+            cu[k] = at->second.u;
+            cv[k] = at->second.v;
+        }
+        if (!have)
             continue;
-        if (!tryPlace(i))
-            continue;
-        for (int id : { cells[i].A, cells[i].B, cells[i].C, cells[i].D })
-            for (int other : vertCells[id])
-                touch(other);
+        for (int e = 0; e < 4; ++e) {
+            int va = id[e];
+            int vb = id[(e + 1) % 4];
+            int ka = va, kb = vb;
+            if (ka > kb)
+                swap(ka, kb);
+            auto found = edgeCells.find({ ka, kb });
+            if (found == edgeCells.end())
+                continue;
+            for (const pair<int, int>& nb : found->second) {
+                int j = nb.first;
+                if (j == i || placed[j])
+                    continue;
+                int nid[4] = { cells[j].A, cells[j].B, cells[j].C, cells[j].D };
+                int e2 = nb.second;
+                int n0 = nid[e2];
+                int n1 = nid[(e2 + 1) % 4];
+                int u0, v0, u1, v1;
+                if (n0 == id[e]) {
+                    u0 = cu[e];
+                    v0 = cv[e];
+                    u1 = cu[(e + 1) % 4];
+                    v1 = cv[(e + 1) % 4];
+                } else {
+                    u0 = cu[(e + 1) % 4];
+                    v0 = cv[(e + 1) % 4];
+                    u1 = cu[e];
+                    v1 = cv[e];
+                }
+                int edx = u1 - u0;
+                int edy = v1 - v0;
+                int sideX[2] = { -edy, edy };
+                int sideY[2] = { edx, -edx };
+                bool seated = false;
+                for (int side = 0; side < 2 && !seated; ++side) {
+                    int nu[4], nv[4];
+                    nu[e2] = u0;
+                    nv[e2] = v0;
+                    nu[(e2 + 1) % 4] = u1;
+                    nv[(e2 + 1) % 4] = v1;
+                    nu[(e2 + 2) % 4] = u1 + sideX[side];
+                    nv[(e2 + 2) % 4] = v1 + sideY[side];
+                    nu[(e2 + 3) % 4] = u0 + sideX[side];
+                    nv[(e2 + 3) % 4] = v0 + sideY[side];
+                    bool ok = true;
+                    for (int k = 0; k < 4 && ok; ++k) {
+                        auto at = coord.find(nid[k]);
+                        if (at != coord.end() && (at->second.u != nu[k] || at->second.v != nv[k]))
+                            ok = false;
+                    }
+                    if (!ok)
+                        continue;
+                    for (int k = 0; k < 4; ++k)
+                        coord[nid[k]] = { nu[k], nv[k] };
+                    placed[j] = 1;
+                    pending.push(j);
+                    seated = true;
+                }
+            }
+        }
     }
 
     map<pair<int, int>, int> atVert;
@@ -2721,6 +2457,7 @@ bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& v
         atVert[{ item.second.u, item.second.v }] = item.first;
 
     map<pair<int, int>, int> occ;
+    vector<int> extra;
     for (int i = 0; i < (int)cells.size(); ++i) {
         if (!placed[i])
             continue;
@@ -2731,7 +2468,12 @@ bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& v
             u0 = min(u0, coord[id[k]].u);
             v0 = min(v0, coord[id[k]].v);
         }
-        occ[{ u0, v0 }] = i;
+        pair<int, int> key{ u0, v0 };
+        auto found = occ.find(key);
+        if (found != occ.end() && found->second != i)
+            extra.push_back(i);
+        else
+            occ[key] = i;
     }
 
     auto emitRect = [&](int u0, int v0, int cellsW, int cellsH) -> bool {
@@ -2778,49 +2520,78 @@ bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& v
         return true;
     };
 
+    vector<char> emitted(cells.size(), 0);
+    auto markRect = [&](int u0, int v0, int w, int h) {
+        for (int v = 0; v < h; ++v) {
+            for (int u = 0; u < w; ++u) {
+                auto found = occ.find({ u0 + u, v0 + v });
+                if (found != occ.end())
+                    emitted[found->second] = 1;
+            }
+        }
+    };
     map<pair<int, int>, char> taken;
     for (const auto& item : occ)
         taken[item.first] = 0;
     for (const auto& item : occ) {
         if (taken[item.first])
             continue;
-        int u0 = item.first.first;
-        int v0 = item.first.second;
-        int cellsW = 0;
-        while (occ.count({ u0 + cellsW, v0 }) && !taken[{ u0 + cellsW, v0 }])
-            cellsW++;
-        int cellsH = 0;
-        bool rowOk = true;
-        while (rowOk) {
-            for (int u = 0; u < cellsW; ++u) {
-                pair<int, int> key{ u0 + u, v0 + cellsH };
-                if (!occ.count(key) || taken[key])
-                    rowOk = false;
+        vector<pair<int, int>> comp;
+        queue<pair<int, int>> walk;
+        walk.push(item.first);
+        taken[item.first] = 1;
+        while (!walk.empty()) {
+            pair<int, int> cur = walk.front();
+            walk.pop();
+            comp.push_back(cur);
+            const int step[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+            for (int s = 0; s < 4; ++s) {
+                pair<int, int> nxt{ cur.first + step[s][0], cur.second + step[s][1] };
+                if (!occ.count(nxt) || taken[nxt])
+                    continue;
+                taken[nxt] = 1;
+                walk.push(nxt);
             }
-            if (rowOk)
-                cellsH++;
         }
-        if (cellsW < 1 || cellsH < 1)
+        int minu = comp[0].first, maxu = comp[0].first, minv = comp[0].second, maxv = comp[0].second;
+        for (const pair<int, int>& cell : comp) {
+            minu = min(minu, cell.first);
+            maxu = max(maxu, cell.first);
+            minv = min(minv, cell.second);
+            maxv = max(maxv, cell.second);
+        }
+        int bw = maxu - minu + 1;
+        int bh = maxv - minv + 1;
+        bool filled = (int)comp.size() == bw * bh;
+        if (filled && emitRect(minu, minv, bw, bh)) {
+            markRect(minu, minv, bw, bh);
             continue;
-        if (!emitRect(u0, v0, cellsW, cellsH)) {
-            for (int v = 0; v < cellsH; ++v) {
-                for (int u = 0; u < cellsW; ++u) {
-                    auto found = occ.find({ u0 + u, v0 + v });
-                    if (found != occ.end())
-                        EmitPatchCell(cells[found->second], verts, contents, material, dest, meshCount, vertCount);
-                    taken[{ u0 + u, v0 + v }] = 1;
+        }
+        for (int v = minv; v <= maxv; ++v) {
+            int u = minu;
+            while (u <= maxu) {
+                if (!occ.count({ u, v })) {
+                    ++u;
+                    continue;
                 }
+                int w = 0;
+                while (occ.count({ u + w, v }))
+                    ++w;
+                if (emitRect(u, v, w, 1))
+                    markRect(u, v, w, 1);
+                else if (emitRect(u, v, 1, 1))
+                    markRect(u, v, 1, 1);
+                u += w;
             }
-            continue;
         }
-        for (int v = 0; v < cellsH; ++v)
-            for (int u = 0; u < cellsW; ++u)
-                taken[{ u0 + u, v0 + v }] = 1;
     }
 
+    for (int cellIndex : extra)
+        EmitPatchCell(cells[cellIndex], verts, contents, material, dest, meshCount, vertCount);
     for (int i = 0; i < (int)cells.size(); ++i) {
-        if (!placed[i])
-            EmitPatchCell(cells[i], verts, contents, material, dest, meshCount, vertCount);
+        if (!emitted[i] && extra.end() == find(extra.begin(), extra.end(), i))
+            if (!placed[i] || !emitted[i])
+                EmitPatchCell(cells[i], verts, contents, material, dest, meshCount, vertCount);
     }
     return true;
 }
@@ -2985,8 +2756,407 @@ struct PosHash {
     }
 };
 
+struct CollKey {
+    int p[9];
+    bool operator==(const CollKey& o) const
+    {
+        for (int i = 0; i < 9; ++i)
+            if (p[i] != o.p[i])
+                return false;
+        return true;
+    }
+};
+
+struct CollKeyHash {
+    size_t operator()(const CollKey& k) const
+    {
+        size_t h = 0;
+        for (int i = 0; i < 9; ++i)
+            h ^= (size_t)k.p[i] * (73856093u + (unsigned)i * 17u);
+        return h;
+    }
+};
+
+int QuantThousand(float v)
+{
+    return (int)llround((double)v * 1000.0);
+}
+
+CollKey MakeCollKey(const float a[3], const float b[3], const float c[3])
+{
+    struct QPoint {
+        int x, y, z;
+        bool operator<(const QPoint& o) const
+        {
+            if (x != o.x) return x < o.x;
+            if (y != o.y) return y < o.y;
+            return z < o.z;
+        }
+    };
+    QPoint pts[3] = {
+        { QuantThousand(a[0]), QuantThousand(a[1]), QuantThousand(a[2]) },
+        { QuantThousand(b[0]), QuantThousand(b[1]), QuantThousand(b[2]) },
+        { QuantThousand(c[0]), QuantThousand(c[1]), QuantThousand(c[2]) }
+    };
+    sort(pts, pts + 3);
+    CollKey key{};
+    for (int i = 0; i < 3; ++i) {
+        key.p[i * 3 + 0] = pts[i].x;
+        key.p[i * 3 + 1] = pts[i].y;
+        key.p[i * 3 + 2] = pts[i].z;
+    }
+    return key;
+}
+
+struct CollisionSet {
+    unordered_set<CollKey, CollKeyHash> present;
+    unordered_map<CollKey, unsigned, CollKeyHash> contents;
+};
+
+CollisionSet BuildCollisionContents(const BspFile& bsp)
+{
+    CollisionSet set;
+    unordered_map<int, unsigned> partContents;
+    unordered_set<int> partBad;
+    unordered_set<int> seenAabb;
+    for (const BspLeafColl& leaf : bsp.leafColl) {
+        if (leaf.collCount <= 0)
+            continue;
+        vector<int> stack;
+        stack.reserve(static_cast<size_t>(leaf.collCount));
+        for (int i = 0; i < leaf.collCount; ++i)
+            stack.push_back(leaf.firstCollAabb + i);
+        for (size_t qi = 0; qi < stack.size(); ++qi) {
+            int idx = stack[qi];
+            if (idx < 0 || idx >= (int)bsp.collisionAabbs.size())
+                continue;
+            if (!seenAabb.insert(idx).second)
+                continue;
+            const BspCollisionAabb& aabb = bsp.collisionAabbs[idx];
+            if (aabb.childCount > 0) {
+                for (int c = 0; c < (int)aabb.childCount; ++c)
+                    stack.push_back(aabb.u + c);
+                continue;
+            }
+            if (aabb.u < 0 || aabb.u >= (int)bsp.collisionParts.size())
+                continue;
+            if (aabb.materialIndex >= bsp.materials.size())
+                continue;
+            if (partBad.count(aabb.u))
+                continue;
+            unsigned cont = bsp.materials[aabb.materialIndex].contentFlags;
+            auto found = partContents.find(aabb.u);
+            if (found == partContents.end())
+                partContents.emplace(aabb.u, cont);
+            else if (found->second != cont) {
+                partContents.erase(found);
+                partBad.insert(aabb.u);
+            }
+        }
+    }
+
+    for (const BspCollisionPart& partition : bsp.collisionParts) {
+        for (int t = 0; t < (int)partition.triCount; ++t) {
+            int triIndex = partition.firstTri + t;
+            if (triIndex < 0 || triIndex >= (int)bsp.collisionTris.size())
+                break;
+            const BspCollisionTri& tri = bsp.collisionTris[triIndex];
+            if (tri.v[0] >= bsp.collisionVerts.size() || tri.v[1] >= bsp.collisionVerts.size()
+                || tri.v[2] >= bsp.collisionVerts.size())
+                continue;
+            set.present.insert(MakeCollKey(bsp.collisionVerts[tri.v[0]].xyz,
+                                           bsp.collisionVerts[tri.v[1]].xyz,
+                                           bsp.collisionVerts[tri.v[2]].xyz));
+        }
+    }
+
+    unordered_set<CollKey, CollKeyHash> ambiguous;
+    for (const auto& item : partContents) {
+        const BspCollisionPart& partition = bsp.collisionParts[item.first];
+        for (int t = 0; t < (int)partition.triCount; ++t) {
+            int triIndex = partition.firstTri + t;
+            if (triIndex < 0 || triIndex >= (int)bsp.collisionTris.size())
+                break;
+            const BspCollisionTri& tri = bsp.collisionTris[triIndex];
+            if (tri.v[0] >= bsp.collisionVerts.size() || tri.v[1] >= bsp.collisionVerts.size()
+                || tri.v[2] >= bsp.collisionVerts.size())
+                continue;
+            CollKey key = MakeCollKey(bsp.collisionVerts[tri.v[0]].xyz,
+                                      bsp.collisionVerts[tri.v[1]].xyz,
+                                      bsp.collisionVerts[tri.v[2]].xyz);
+            if (ambiguous.count(key))
+                continue;
+            auto found = set.contents.find(key);
+            if (found == set.contents.end())
+                set.contents.emplace(key, item.second);
+            else if (found->second != item.second) {
+                set.contents.erase(found);
+                ambiguous.insert(key);
+            }
+        }
+    }
+    return set;
+}
+
+bool PlaneFromFace(const Vec3& a, const Vec3& b, const Vec3& c, PlaneD& out)
+{
+    Vec3 n = Cross(Sub(b, a), Sub(c, a));
+    double len = Len(n);
+    if (len < 1e-8)
+        return false;
+    n = Mul(n, 1.0 / len);
+    out.n[0] = n.x;
+    out.n[1] = n.y;
+    out.n[2] = n.z;
+    out.dist = Dot(n, a);
+    return true;
+}
+
+bool SamePortalPlane(const PlaneD& a, const PlaneD& b)
+{
+    double dot = a.n[0] * b.n[0] + a.n[1] * b.n[1] + a.n[2] * b.n[2];
+    if (dot > 0.999 && fabs(a.dist - b.dist) <= 0.2)
+        return true;
+    if (dot < -0.999 && fabs(a.dist + b.dist) <= 0.2)
+        return true;
+    return false;
+}
+
+vector<Vec3> HullOnPlane(const vector<Vec3>& points, const Vec3& normal)
+{
+    Vec3 up = fabs(normal.z) < 0.9 ? Vec3{ 0, 0, 1 } : Vec3{ 1, 0, 0 };
+    Vec3 tangent = Cross(normal, up);
+    double tlen = Len(tangent);
+    if (tlen < 1e-8)
+        return {};
+    tangent = Mul(tangent, 1.0 / tlen);
+    Vec3 bitangent = Cross(normal, tangent);
+
+    struct Q {
+        double u, v;
+        Vec3 p;
+    };
+    vector<Q> uniq;
+    for (const Vec3& p : points) {
+        bool have = false;
+        for (const Q& q : uniq) {
+            if (fabs(q.p.x - p.x) <= 0.05 && fabs(q.p.y - p.y) <= 0.05 && fabs(q.p.z - p.z) <= 0.05) {
+                have = true;
+                break;
+            }
+        }
+        if (!have)
+            uniq.push_back({ Dot(p, tangent), Dot(p, bitangent), p });
+    }
+    if (uniq.size() < 3)
+        return {};
+    sort(uniq.begin(), uniq.end(), [](const Q& a, const Q& b) {
+        if (a.u != b.u)
+            return a.u < b.u;
+        return a.v < b.v;
+    });
+    auto turn = [](const Q& o, const Q& a, const Q& c) {
+        return (a.u - o.u) * (c.v - o.v) - (a.v - o.v) * (c.u - o.u);
+    };
+    vector<Q> hull;
+    for (const Q& p : uniq) {
+        while (hull.size() >= 2 && turn(hull[hull.size() - 2], hull.back(), p) <= 1e-6)
+            hull.pop_back();
+        hull.push_back(p);
+    }
+    size_t lower = hull.size();
+    for (int i = (int)uniq.size() - 2; i >= 0; --i) {
+        const Q& p = uniq[i];
+        while (hull.size() > lower && turn(hull[hull.size() - 2], hull.back(), p) <= 1e-6)
+            hull.pop_back();
+        hull.push_back(p);
+    }
+    if (!hull.empty())
+        hull.pop_back();
+    vector<Vec3> out;
+    for (const Q& q : hull)
+        out.push_back(q.p);
+    return out.size() >= 3 ? out : vector<Vec3>{};
+}
+
+// R_LoadPortals winding, written onto the brush that already has that portal
+// face. Thickness and the brush's own materials stay.
+void ApplyPortalShapes(const BspFile& bsp, vector<BrushOut>& brushes, vector<SideGeom>& allSides,
+                       vector<int>& brushSideStart)
+{
+    if (bsp.portals.empty() || brushes.empty())
+        return;
+
+    struct LumpFace {
+        PlaneD plane;
+        vector<Vec3> winding;
+        Vec3 centroid;
+        int owner = -1;
+        int ownerSide = -1;
+        double score = 1e30;
+    };
+    vector<LumpFace> lumps;
+    for (const BspPortal& portal : bsp.portals) {
+        if (portal.planeIndex < 0 || portal.planeIndex >= (int)bsp.planes.size())
+            continue;
+        int count = portal.vertCount;
+        if (count < 3 || count > 64)
+            continue;
+        if (portal.firstVert < 0 || portal.firstVert > (int)bsp.portalVerts.size() - count)
+            continue;
+        const BspPlane& src = bsp.planes[portal.planeIndex];
+        Vec3 n{ src.normal[0], src.normal[1], src.normal[2] };
+        double len = Len(n);
+        if (len < 1e-8)
+            continue;
+        n = Mul(n, 1.0 / len);
+        LumpFace face;
+        face.plane.n[0] = n.x;
+        face.plane.n[1] = n.y;
+        face.plane.n[2] = n.z;
+        face.plane.dist = (src.normal[0] * src.dist + src.normal[1] * src.dist + src.normal[2] * src.dist) / (len * len);
+        face.plane.dist = src.dist / len;
+        face.centroid = { 0, 0, 0 };
+        for (int i = 0; i < count; ++i) {
+            const float* p = bsp.portalVerts[portal.firstVert + i].xyz;
+            Vec3 v{ p[0], p[1], p[2] };
+            face.winding.push_back(v);
+            face.centroid = Add(face.centroid, v);
+        }
+        face.centroid = Mul(face.centroid, 1.0 / count);
+        lumps.push_back(move(face));
+    }
+    if (lumps.empty())
+        return;
+
+    for (int b = 0; b < (int)brushes.size(); ++b) {
+        int begin = brushSideStart[b];
+        int end = brushSideStart[b + 1];
+        for (int s = begin; s < end; ++s) {
+            if (!SideIsPortal(allSides[s].surfaceFlags))
+                continue;
+            for (LumpFace& lump : lumps) {
+                if (!SamePortalPlane(allSides[s].plane, lump.plane))
+                    continue;
+                Vec3 mid{ 0, 0, 0 };
+                if (!allSides[s].winding.empty()) {
+                    for (const Vec3& p : allSides[s].winding)
+                        mid = Add(mid, p);
+                    mid = Mul(mid, 1.0 / (double)allSides[s].winding.size());
+                }
+                double dist = Len(Sub(lump.centroid, mid));
+                if (dist >= lump.score)
+                    continue;
+                lump.score = dist;
+                lump.owner = b;
+                lump.ownerSide = s;
+            }
+        }
+    }
+
+    auto sameSpot = [](const LumpFace& a, const LumpFace& b) {
+        if (a.winding.size() != b.winding.size() || !SamePortalPlane(a.plane, b.plane))
+            return false;
+        for (const Vec3& p : a.winding) {
+            bool hit = false;
+            for (const Vec3& q : b.winding) {
+                if (fabs(p.x - q.x) <= 0.5 && fabs(p.y - q.y) <= 0.5 && fabs(p.z - q.z) <= 0.5) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit)
+                return false;
+        }
+        return true;
+    };
+
+    vector<char> kill(brushes.size(), 0);
+    vector<LumpFace> kept;
+    int sideEnd = brushSideStart.back();
+    for (const LumpFace& lump : lumps) {
+        if (lump.owner < 0 || lump.ownerSide < 0 || lump.winding.size() < 3)
+            continue;
+        bool copy = false;
+        for (const LumpFace& prev : kept) {
+            if (sameSpot(prev, lump)) {
+                copy = true;
+                break;
+            }
+        }
+        if (copy)
+            continue;
+        kept.push_back(lump);
+
+        int b = lump.owner;
+        int bestSide = lump.ownerSide;
+        int begin = brushSideStart[b];
+        int end = brushSideStart[b + 1];
+        int portalFace = allSides[bestSide].faceIndex;
+        if (portalFace < 0 || portalFace >= (int)brushes[b].faces.size())
+            continue;
+        string portalMat = brushes[b].faces[portalFace].material;
+        string skirtMat = portalMat;
+        for (int s = begin; s < end; ++s) {
+            if (s == bestSide || allSides[s].faceIndex < 0
+                || allSides[s].faceIndex >= (int)brushes[b].faces.size())
+                continue;
+            skirtMat = brushes[b].faces[allSides[s].faceIndex].material;
+            break;
+        }
+
+        Vec3 axis{ lump.plane.n[0], lump.plane.n[1], lump.plane.n[2] };
+        double minD = 0;
+        double maxD = 0;
+        for (int s = begin; s < end; ++s) {
+            for (const Vec3& p : allSides[s].winding) {
+                double d = lump.plane.Dist(p);
+                minD = min(minD, d);
+                maxD = max(maxD, d);
+            }
+        }
+        double thickness = max(-minD, maxD);
+        if (thickness < 0.5)
+            thickness = 0.5;
+        Vec3 extrude = Mul(axis, (-minD >= maxD) ? -thickness : thickness);
+
+        vector<Vec3> w = lump.winding;
+        for (Vec3& p : w) {
+            double d = lump.plane.Dist(p);
+            p = Sub(p, Mul(axis, d));
+        }
+        if (Dot(axis, extrude) < 0)
+            reverse(w.begin(), w.end());
+
+        BrushOut neu;
+        neu.portal = true;
+        neu.contents = brushes[b].contents;
+        auto put = [&](const Vec3& a, const Vec3& mid, const Vec3& c, const string& material) {
+            FaceOut face;
+            face.material = material;
+            face.p[0] = a;
+            face.p[1] = mid;
+            face.p[2] = c;
+            neu.faces.push_back(face);
+        };
+        put(w[2], w[1], w[0], portalMat);
+        for (int i = 0; i < (int)w.size(); ++i)
+            put(w[i], w[(i + 1) % w.size()], Add(w[i], extrude), skirtMat);
+        put(Add(w[0], extrude), Add(w[1], extrude), Add(w[2], extrude), skirtMat);
+        brushes.push_back(move(neu));
+        brushSideStart.push_back(sideEnd);
+        kill[b] = 1;
+    }
+
+    for (int b = 0; b < (int)kill.size(); ++b) {
+        if (kill[b])
+            brushes[b].faces.clear();
+    }
+}
+
 ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, const vector<int>& matName,
-                    const Names& names, int caulk, int& dropped, int& meshCount, int& vertCount, int& triMeshes)
+                    const Names& names, int caulk, const CollisionSet* collision,
+                    int& dropped, int& meshCount, int& vertCount, int& triMeshes)
 {
     ModelGeo geo;
     const BspModel& model = bsp.models[modelIndex];
@@ -3021,8 +3191,6 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
         geo.brushes.push_back(move(brush));
     }
 
-    RecoverPortalBrushes(geo.brushes, allSides, brushSideStart, names, caulk);
-
     for (int b = 0; b < (int)geo.brushes.size(); ++b) {
         int begin = brushSideStart[b];
         int end = brushSideStart[b + 1];
@@ -3038,6 +3206,7 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
                 geo.brushes[b].faces[side.faceIndex].material = resolved;
         }
     }
+    ApplyPortalShapes(bsp, geo.brushes, allSides, brushSideStart);
     FitAllBrushTextures(bsp, modelIndex, origin, matName, names, allSides, geo.brushes, brushSideStart);
 
     vector<SideGeom> live;
@@ -3048,24 +3217,52 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
     SideGrid sideGrid;
     sideGrid.build(live);
 
+    struct WeldCell {
+        int x, y, z;
+        bool operator==(const WeldCell& o) const { return x == o.x && y == o.y && z == o.z; }
+    };
+    struct WeldCellHash {
+        size_t operator()(const WeldCell& k) const
+        {
+            return ((size_t)k.x * 73856093u) ^ ((size_t)k.y * 19349663u) ^ ((size_t)k.z * 83492791u);
+        }
+    };
     vector<WeldVert> weld;
-    unordered_map<WeldKey, int, WeldHash> weldLookup;
+    unordered_map<WeldCell, vector<int>, WeldCellHash> weldGrid;
     unordered_map<BucketKey, vector<Tri>, BucketHash> buckets;
     unordered_set<PosKey, PosHash> seenTris;
 
+    auto weldCell = [](const Vec3& p) {
+        return WeldCell{ (int)floor(p.x / kPatchWeld), (int)floor(p.y / kPatchWeld), (int)floor(p.z / kPatchWeld) };
+    };
     auto weldPoint = [&](const BspDrawVert& vert) -> int {
         Vec3 p = FromVert(vert, origin);
-        WeldKey key;
-        key.x = llround(p.x * 100.0);
-        key.y = llround(p.y * 100.0);
-        key.z = llround(p.z * 100.0);
-        key.s = llround((double)vert.texCoord[0] * 100000.0);
-        key.t = llround((double)vert.texCoord[1] * 100000.0);
-        key.color = ((long long)vert.color[0] << 24) | ((long long)vert.color[1] << 16)
-                  | ((long long)vert.color[2] << 8) | vert.color[3];
-        auto found = weldLookup.find(key);
-        if (found != weldLookup.end())
-            return found->second;
+        WeldCell cell = weldCell(p);
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    auto found = weldGrid.find({ cell.x + dx, cell.y + dy, cell.z + dz });
+                    if (found == weldGrid.end())
+                        continue;
+                    for (int id : found->second) {
+                        const WeldVert& other = weld[id];
+                        if (fabs(other.p.x - p.x) > kPatchWeld || fabs(other.p.y - p.y) > kPatchWeld
+                            || fabs(other.p.z - p.z) > kPatchWeld)
+                            continue;
+                        if (fabs((double)other.st[0] - (double)vert.texCoord[0]) > kPatchSt
+                            || fabs((double)other.st[1] - (double)vert.texCoord[1]) > kPatchSt)
+                            continue;
+                        if (fabs((double)other.lm[0] - (double)vert.lmapCoord[0]) > kPatchSt
+                            || fabs((double)other.lm[1] - (double)vert.lmapCoord[1]) > kPatchSt)
+                            continue;
+                        if (other.color[0] != vert.color[0] || other.color[1] != vert.color[1]
+                            || other.color[2] != vert.color[2] || other.color[3] != vert.color[3])
+                            continue;
+                        return id;
+                    }
+                }
+            }
+        }
         WeldVert out;
         out.p = p;
         out.st[0] = vert.texCoord[0];
@@ -3078,7 +3275,7 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
         memcpy(out.color, vert.color, 4);
         int id = (int)weld.size();
         weld.push_back(out);
-        weldLookup.emplace(key, id);
+        weldGrid[cell].push_back(id);
         return id;
     };
 
@@ -3086,7 +3283,7 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
         if (soup.materialIndex >= bsp.materials.size() || soup.indexCount < 3)
             return;
         int nameId = MatchNameId(bsp, names, matName, soup.materialIndex);
-        unsigned contents = bsp.materials[soup.materialIndex].contentFlags;
+        unsigned soupContents = bsp.materials[soup.materialIndex].contentFlags;
         for (int i = 0; i + 2 < soup.indexCount; i += 3) {
             int ia = ResolveVert(soup, bsp.indices[type], i, (int)bsp.verts[type].size());
             int ib = ResolveVert(soup, bsp.indices[type], i + 1, (int)bsp.verts[type].size());
@@ -3096,23 +3293,35 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
             Vec3 a = FromVert(bsp.verts[type][ia], origin);
             Vec3 b = FromVert(bsp.verts[type][ib], origin);
             Vec3 c = FromVert(bsp.verts[type][ic], origin);
-            if (Len(Cross(Sub(b, a), Sub(c, a))) < 0.01)
+            Vec3 cr = Cross(Sub(b, a), Sub(c, a));
+            if (Dot(cr, cr) < 1e-12)
                 continue;
-            bool covered = false;
-            sideGrid.query(a, b, c, [&](int sideIndex) {
-                if (covered || live[sideIndex].nameId != nameId)
-                    return;
-                if (TriangleOnSide(live[sideIndex], a, b, c))
-                    covered = true;
-            });
-            if (covered)
+            unsigned contents = soupContents;
+            bool inCollision = false;
+            if (collision) {
+                CollKey collKey = MakeCollKey(bsp.verts[type][ia].xyz, bsp.verts[type][ib].xyz, bsp.verts[type][ic].xyz);
+                if (collision->present.count(collKey)) {
+                    inCollision = true;
+                    auto coll = collision->contents.find(collKey);
+                    if (coll != collision->contents.end()
+                        && IsWeaponClipFlags(coll->second) && !IsWeaponClipFlags(contents))
+                        contents = coll->second;
+                }
+            }
+            // Brush faces are not in the collision lump. Vertex alpha on those
+            // faces is the compiled color, not a second patch. A decal or
+            // terrain patch is kept when it is a collision triangle or its
+            // material is non-colliding, or when its vertices are not on a brush.
+            bool nonColliding = (soupContents & (unsigned)kContentsNonColliding) != 0;
+            if (!inCollision && !nonColliding
+                && VerticesOnBrushSides(sideGrid, live, nameId, a, b, c))
                 continue;
 
             struct PointKey { int x, y, z; };
             PointKey points[3] = {
-                { (int)llround(a.x * 4), (int)llround(a.y * 4), (int)llround(a.z * 4) },
-                { (int)llround(b.x * 4), (int)llround(b.y * 4), (int)llround(b.z * 4) },
-                { (int)llround(c.x * 4), (int)llround(c.y * 4), (int)llround(c.z * 4) }
+                { (int)llround(a.x * 1000.0), (int)llround(a.y * 1000.0), (int)llround(a.z * 1000.0) },
+                { (int)llround(b.x * 1000.0), (int)llround(b.y * 1000.0), (int)llround(b.z * 1000.0) },
+                { (int)llround(c.x * 1000.0), (int)llround(c.y * 1000.0), (int)llround(c.z * 1000.0) }
             };
             sort(points, points + 3, [](const PointKey& lhs, const PointKey& rhs) {
                 if (lhs.x != rhs.x) return lhs.x < rhs.x;
@@ -4335,6 +4544,8 @@ void SealParsedPlanes(const vector<BrushOut*>& brushes)
             brush.faces = original;
             pool.Restore(mark, markHash);
             if (!CodAssign(pool, brush, brushIndex, sideFaces, nums, &hit, &err)) {
+                if (brush.portal)
+                    continue;
                 brush.faces.clear();
                 left++;
                 cout << "plane seal dropped brush " << brushIndex << " error " << err << endl;
@@ -4345,6 +4556,157 @@ void SealParsedPlanes(const vector<BrushOut*>& brushes)
     }
     if (moved || left)
         cout << "plane seal moved " << moved << " brushes, dropped " << left << endl;
+}
+
+string FormatFloat(double v)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.9g", v);
+    return buf;
+}
+
+string FormatVec3(double x, double y, double z)
+{
+    return FormatFloat(x) + " " + FormatFloat(y) + " " + FormatFloat(z);
+}
+
+string CStringN(const char* text, int cap)
+{
+    int n = 0;
+    while (n < cap && text[n])
+        ++n;
+    return string(text, text + n);
+}
+
+bool NearPoint(const Vec3& a, const Vec3& b)
+{
+    return fabs(a.x - b.x) <= kPatchWeld && fabs(a.y - b.y) <= kPatchWeld && fabs(a.z - b.z) <= kPatchWeld;
+}
+
+double FovFromCosHalf(float cosHalf)
+{
+    double c = cosHalf;
+    if (c > 1.0)
+        c = 1.0;
+    if (c < -1.0)
+        c = -1.0;
+    return acos(c) * (360.0 / kPi);
+}
+
+void AddMissingPrimaryLights(const BspFile& bsp, vector<Ent>& ents)
+{
+    vector<Vec3> have;
+    unordered_set<string> names;
+    for (const Ent& ent : ents) {
+        string targetname = KeyOf(ent, "targetname");
+        if (!targetname.empty())
+            names.insert(targetname);
+        string target = KeyOf(ent, "target");
+        if (!target.empty())
+            names.insert(target);
+        if (IsLightClass(ClassName(ent)))
+            have.push_back(OriginOf(ent));
+    }
+
+    int added = 0;
+    for (int i = 0; i < (int)bsp.primaryLights.size(); ++i) {
+        const BspPrimaryLight& light = bsp.primaryLights[i];
+        if (light.type != 2 && light.type != 3)
+            continue;
+        if (!(light.radius > 0.f))
+            continue;
+        Vec3 origin{ light.origin[0], light.origin[1], light.origin[2] };
+        bool exists = false;
+        for (const Vec3& at : have)
+            exists = exists || NearPoint(at, origin);
+        if (exists)
+            continue;
+
+        Vec3 dir{ light.dir[0], light.dir[1], light.dir[2] };
+        double dirLen = Len(dir);
+        if (dirLen < 1e-8)
+            continue;
+        dir = Mul(dir, 1.0 / dirLen);
+
+        double cosOuter = light.cosHalfFovOuter;
+        if (cosOuter > 1.0)
+            cosOuter = 1.0;
+        if (cosOuter < -1.0)
+            cosOuter = -1.0;
+        double half = acos(cosOuter);
+        double dist = 64.0;
+        double sine = sin(half);
+        if (sine > 1e-6) {
+            double along = 64.0 * cos(half) / sine;
+            if (along > 1.0)
+                dist = along;
+        }
+        Vec3 aim = Sub(origin, Mul(dir, dist));
+
+        string target = "light_target_" + to_string(i);
+        while (names.count(target))
+            target += "_";
+        names.insert(target);
+
+        float maxChannel = light.color[0];
+        if (light.color[1] > maxChannel)
+            maxChannel = light.color[1];
+        if (light.color[2] > maxChannel)
+            maxChannel = light.color[2];
+        float color[3];
+        float intensity;
+        if (maxChannel == 0.f) {
+            color[0] = color[1] = color[2] = 1.f;
+            intensity = 0.f;
+        } else {
+            color[0] = light.color[0] / maxChannel;
+            color[1] = light.color[1] / maxChannel;
+            color[2] = light.color[2] / maxChannel;
+            intensity = maxChannel;
+        }
+
+        int spawn = light.type == 2 ? 2 : 1;
+        bool moving = light.translationLimit != 0.f || fabsf(light.rotationLimit - 1.f) > 1e-6f;
+        if (moving)
+            spawn |= 4;
+        if (light.canUseShadowMap == 0)
+            spawn |= 8;
+
+        Ent lamp;
+        lamp.pairs.push_back({ "classname", "light" });
+        lamp.pairs.push_back({ "origin", FormatVec3(origin.x, origin.y, origin.z) });
+        string def = CStringN(light.defName, 64);
+        if (!def.empty())
+            lamp.pairs.push_back({ "def", def });
+        lamp.pairs.push_back({ "radius", FormatFloat(light.radius) });
+        lamp.pairs.push_back({ "_color", FormatVec3(color[0], color[1], color[2]) });
+        lamp.pairs.push_back({ "intensity", FormatFloat(intensity) });
+        lamp.pairs.push_back({ "fov_outer", FormatFloat(FovFromCosHalf(light.cosHalfFovOuter)) });
+        lamp.pairs.push_back({ "fov_inner", FormatFloat(FovFromCosHalf(light.cosHalfFovInner)) });
+        if (light.type == 2)
+            lamp.pairs.push_back({ "exponent", to_string(light.coneExponent) });
+        lamp.pairs.push_back({ "target", target });
+        lamp.pairs.push_back({ "spawnflags", to_string(spawn) });
+        if (moving) {
+            double turnCos = light.rotationLimit;
+            if (turnCos > 1.0)
+                turnCos = 1.0;
+            if (turnCos < -1.0)
+                turnCos = -1.0;
+            lamp.pairs.push_back({ "maxmove", FormatFloat(light.translationLimit) });
+            lamp.pairs.push_back({ "maxturn", FormatFloat(acos(turnCos) * (180.0 / kPi)) });
+        }
+
+        Ent marker;
+        marker.pairs.push_back({ "classname", "info_null" });
+        marker.pairs.push_back({ "origin", FormatVec3(aim.x, aim.y, aim.z) });
+        marker.pairs.push_back({ "targetname", target });
+        ents.push_back(move(lamp));
+        ents.push_back(move(marker));
+        added++;
+    }
+    if (added)
+        cout << "restored " << added << " primary lights" << endl;
 }
 
 } // namespace
@@ -4382,6 +4744,8 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
         ents.insert(ents.begin(), move(world));
         worldIndex = 0;
     }
+
+    AddMissingPrimaryLights(bsp, ents);
 
     unordered_set<string> lightTargets;
     vector<char> geoEnt(ents.size(), 0);
@@ -4504,10 +4868,11 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
         stats.warning = "unreferenced brush models were merged into the geo map";
 
     gDropSides = gDropMat = gDropPlane = gDropFaces = gDropSolid = 0;
+    const CollisionSet collisionContents = BuildCollisionContents(bsp);
     vector<ModelGeo> models(bsp.models.size());
     for (int m = 0; m < (int)bsp.models.size(); ++m) {
         cout << "model " << m << "/" << bsp.models.size() << endl;
-        models[m] = BuildModel(bsp, m, origins[m], matName, names, caulk,
+        models[m] = BuildModel(bsp, m, origins[m], matName, names, caulk, &collisionContents,
                                stats.droppedBrushes, stats.meshes, stats.meshVerts, stats.triangleMeshes);
     }
     cout << "drop reasons sides=" << gDropSides << " mat=" << gDropMat << " plane=" << gDropPlane

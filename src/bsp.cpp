@@ -267,6 +267,11 @@ BspFile LoadBsp(const wstring& path)
     static_assert(sizeof(BspTriSoup) == 24, "trisoup");
     static_assert(sizeof(BspDrawVert) == 68, "draw vert");
     static_assert(sizeof(BspModel) == 48, "model");
+    static_assert(sizeof(BspCollisionVert) == 12, "collision vert");
+    static_assert(sizeof(BspCollisionTri) == 6, "collision tri");
+    static_assert(sizeof(BspCollisionPart) == 12, "collision partition");
+    static_assert(sizeof(BspPortal) == 16, "portal");
+    static_assert(sizeof(BspPortalVert) == 12, "portal vert");
 
     Reader reader(path);
     const int ident = reader.ReadAt<int>(0);
@@ -283,6 +288,8 @@ BspFile LoadBsp(const wstring& path)
     bsp.version = version;
     bsp.materials = ReadArray<BspMaterial>(reader, chunks, kLumpMaterials);
     bsp.planes = ReadArray<BspPlane>(reader, chunks, kLumpPlanes);
+    bsp.portalVerts = ReadArray<BspPortalVert>(reader, chunks, kLumpPortalVerts);
+    bsp.portals = ReadArray<BspPortal>(reader, chunks, kLumpPortals);
     bsp.sides = ReadArray<BspBrushSide>(reader, chunks, kLumpBrushSides);
     bsp.edgeCounts = ReadArray<unsigned char>(reader, chunks, kLumpBrushSideEdgeCounts);
     bsp.edges = ReadArray<unsigned char>(reader, chunks, kLumpBrushEdges);
@@ -295,6 +302,32 @@ BspFile LoadBsp(const wstring& path)
     bsp.indices[1] = ReadArray<unsigned short>(reader, chunks, kLumpSimpleDrawIndices);
     bsp.models = ReadArray<BspModel>(reader, chunks, kLumpModels);
     bsp.collisionAabbs = ReadArray<BspCollisionAabb>(reader, chunks, kLumpCollisionAabbs);
+    bsp.collisionVerts = ReadArray<BspCollisionVert>(reader, chunks, kLumpCollisionVerts);
+    bsp.collisionTris = ReadArray<BspCollisionTri>(reader, chunks, kLumpCollisionTris);
+    bsp.collisionParts = ReadArray<BspCollisionPart>(reader, chunks, kLumpCollisionPartitions);
+
+    if (const Chunk* leaf = FindChunk(chunks, kLumpLeafs)) {
+        int record = 0;
+        int firstOffset = 0;
+        if (version >= 15 && leaf->size % 24 == 0) {
+            record = 24;
+            firstOffset = 4;
+        } else if (version < 15 && leaf->size % 36 == 0) {
+            record = 36;
+            firstOffset = 8;
+        }
+        if (record && leaf->size > 0) {
+            vector<unsigned char> raw(static_cast<size_t>(leaf->size));
+            reader.ReadExact(raw.data(), leaf->offset, raw.size());
+            const int count = leaf->size / record;
+            bsp.leafColl.resize(static_cast<size_t>(count));
+            for (int i = 0; i < count; ++i) {
+                const unsigned char* at = raw.data() + static_cast<size_t>(i) * record + firstOffset;
+                memcpy(&bsp.leafColl[i].firstCollAabb, at, 4);
+                memcpy(&bsp.leafColl[i].collCount, at + 4, 4);
+            }
+        }
+    }
 
     if (const Chunk* ents = FindChunk(chunks, kLumpEntities)) {
         if (ents->size > 0) {
