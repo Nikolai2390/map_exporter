@@ -9,7 +9,6 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kOnPlane = 0.2;
 constexpr double kInsideSlop = 1.0;
-// Radiant's patchMesh_t::ctrl is [16][16]. A wider or taller mesh writes off the end and crashes on load.
 constexpr int kMaxPatch = 16;
 
 struct Vec3 {
@@ -159,9 +158,6 @@ void WriteNum(FILE* f, double v)
 
 bool IsWeaponClipFlags(unsigned flags)
 {
-    // ParseRawBrush clears SOLID and DETAIL, then sets both clip bits, for the
-    // weaponClip contents line. SetBrushContents may put DETAIL back on a
-    // translucent material. SOLID stays clear.
     const unsigned clips = (unsigned)kContentsClipShot | (unsigned)kContentsMissileClip;
     return (flags & clips) == clips && (flags & (unsigned)kContentsSolid) == 0;
 }
@@ -381,8 +377,6 @@ bool PlaneFromFacePoints(const float p0[3], const float p1[3], const float p2[3]
     return true;
 }
 
-// Tris_PickBestTriangle: every triple of the side winding, largest area along
-// the face normal. Those three winding vertices are the map face.
 bool PickFaceFromWinding(const vector<Vec3>& winding, const PlaneD& plane, Vec3 out[3])
 {
     const int n = (int)winding.size();
@@ -862,9 +856,6 @@ void FitBrushPlanes(vector<FaceOut>& faces, const vector<PlaneD>& sourcePlanes, 
 
     vector<Vec3> bestPoints = capture();
     PlaneHit best = AuditFacePlanes(faces);
-    // The winding corners already reproduce the planes. Replacing them with a
-    // multi-thousand-unit triangle survives the in-memory check and then
-    // shifts when the map text is parsed, so portal volumes disappear.
     if (best.slack >= 0.04f)
         return;
     float brushSpan = (float)max(extent, 16.0);
@@ -1493,9 +1484,6 @@ template <typename Fn>
 void ForSoups(const BspFile& bsp, int model, Fn&& fn)
 {
     const BspModel& mdl = bsp.models[model];
-    // Simple (1) keeps the mesh vertex color and alpha. Layered (0) stores
-    // blend weights in those bytes. Walking simple first keeps the color when
-    // both soups contain the same triangle.
     const int soupOrder[2] = { 1, 0 };
     for (int type : soupOrder) {
         int first = mdl.firstTriSoup[type];
@@ -1726,11 +1714,9 @@ void FitAllBrushTextures(const BspFile& bsp, int model, const Vec3& origin, cons
 
 bool SameCompiledPoint(const Vec3& a, const Vec3& b)
 {
-    // com_vector.h VEC_EPSILON. Per component, same as Vec3Equal.
     return fabs(a.x - b.x) <= 0.001 && fabs(a.y - b.y) <= 0.001 && fabs(a.z - b.z) <= 0.001;
 }
 
-// tris.cpp TRIS_ON_EPSILON. Brush-face draw vertices lie on the side plane by this much.
 constexpr double kTrisOnEpsilon = 0.1;
 
 bool PointInsideSide(const SideGeom& side, const Vec3& p)
@@ -1741,27 +1727,24 @@ bool PointInsideSide(const SideGeom& side, const Vec3& p)
     return InsideConvex(side.winding, p, n, kTrisOnEpsilon);
 }
 
-// Drop a draw triangle only when one brush side of this material covers the
-// whole triangle, including its centroid. A triangle that merely puts its
-// corners on neighboring sides still spans the gap between those sides.
 bool VerticesOnBrushSides(SideGrid& grid, const vector<SideGeom>& sides, int nameId,
                           const Vec3& a, const Vec3& b, const Vec3& c)
 {
-    Vec3 mid = Mul(Add(Add(a, b), c), 1.0 / 3.0);
-    bool covered = false;
-    grid.query(a, b, c, [&](int sideIndex) {
-        if (covered || sides[sideIndex].nameId != nameId)
-            return;
-        const SideGeom& side = sides[sideIndex];
-        if (PointInsideSide(side, a) && PointInsideSide(side, b) && PointInsideSide(side, c)
-            && PointInsideSide(side, mid))
-            covered = true;
-    });
-    return covered;
+    const Vec3 pts[4] = { a, b, c, Mul(Add(Add(a, b), c), 1.0 / 3.0) };
+    for (const Vec3& p : pts) {
+        bool on = false;
+        grid.query(p, p, p, [&](int sideIndex) {
+            if (on || sides[sideIndex].nameId != nameId)
+                return;
+            if (PointInsideSide(sides[sideIndex], p))
+                on = true;
+        });
+        if (!on)
+            return false;
+    }
+    return true;
 }
 
-// FindSharedVertex: VEC_EPSILON on xyz, PATCH_ST_EPSILON on st. The BSP vertex
-// is already the compiled position, so it is kept as stored.
 constexpr double kPatchWeld = 0.001;
 constexpr double kPatchSt = 1e-5;
 
@@ -2298,8 +2281,6 @@ void EdgeSt(const vector<WeldVert>& verts, int i, int j, double& ds, double& dt)
     dt = fabs((double)verts[i].st[1] - (double)verts[j].st[1]);
 }
 
-// MeshToTriangles splits each grid cell on a diagonal. On a patch the diagonal
-// moves both texture axes; a grid edge keeps one axis fixed.
 bool DiagonalInSt(const PatchCell& cell, const vector<WeldVert>& verts)
 {
     double ds, dt;
@@ -2979,8 +2960,6 @@ vector<Vec3> HullOnPlane(const vector<Vec3>& points, const Vec3& normal)
     return out.size() >= 3 ? out : vector<Vec3>{};
 }
 
-// R_LoadPortals winding, written onto the brush that already has that portal
-// face. Thickness and the brush's own materials stay.
 void ApplyPortalShapes(const BspFile& bsp, vector<BrushOut>& brushes, vector<SideGeom>& allSides,
                        vector<int>& brushSideStart)
 {
@@ -3296,6 +3275,10 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
             Vec3 cr = Cross(Sub(b, a), Sub(c, a));
             if (Dot(cr, cr) < 1e-12)
                 continue;
+            int alpha = ((int)bsp.verts[type][ia].color[3] + (int)bsp.verts[type][ib].color[3]
+                + (int)bsp.verts[type][ic].color[3] + 2) / 3;
+            if (alpha == 0)
+                continue;
             unsigned contents = soupContents;
             bool inCollision = false;
             if (collision) {
@@ -3308,13 +3291,7 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
                         contents = coll->second;
                 }
             }
-            // Brush faces are not in the collision lump. Vertex alpha on those
-            // faces is the compiled color, not a second patch. A decal or
-            // terrain patch is kept when it is a collision triangle or its
-            // material is non-colliding, or when its vertices are not on a brush.
-            bool nonColliding = (soupContents & (unsigned)kContentsNonColliding) != 0;
-            if (!inCollision && !nonColliding
-                && VerticesOnBrushSides(sideGrid, live, nameId, a, b, c))
+            if (VerticesOnBrushSides(sideGrid, live, nameId, a, b, c))
                 continue;
 
             struct PointKey { int x, y, z; };
@@ -3638,6 +3615,31 @@ bool RecoverClosedBrushes(const vector<WeldVert>& verts, const vector<Tri>& tris
         brushes.push_back(move(brush));
         for (int ti : ids)
             used[ti] = 1;
+        for (int ti = 0; ti < (int)tris.size(); ++ti) {
+            if (used[ti])
+                continue;
+            int corner[3] = { tris[ti].a, tris[ti].b, tris[ti].c };
+            bool onBrush = true;
+            for (int id : corner) {
+                const Vec3& point = verts[id].p;
+                bool onPlane = false;
+                for (const PlaneGroup& plane : planes) {
+                    double d = plane.plane.Dist(point);
+                    if (d > 0.15) {
+                        onBrush = false;
+                        break;
+                    }
+                    if (fabs(d) <= 0.15)
+                        onPlane = true;
+                }
+                if (!onBrush || !onPlane) {
+                    onBrush = false;
+                    break;
+                }
+            }
+            if (onBrush)
+                used[ti] = 1;
+        }
         any = true;
     }
     return any;
@@ -3887,7 +3889,6 @@ void WriteMesh(FILE* f, int index, const MeshOut& mesh)
     fputs(" }\n}\n", f);
 }
 
-// cod4rad LightGrid_PointToOrigin: (index - bias) * spacing, bias 0x1000 / 0x0800.
 double GridToWorld(int index, int axis)
 {
     if (axis == 2)
@@ -4709,7 +4710,7 @@ void AddMissingPrimaryLights(const BspFile& bsp, vector<Ent>& ents)
         cout << "restored " << added << " primary lights" << endl;
 }
 
-} // namespace
+}
 
 ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
 {
