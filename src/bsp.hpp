@@ -29,7 +29,6 @@ enum BspLump : int {
     kLumpEntities = 39,
     kLumpReflectionProbes = 41,
     kLumpPrimaryLights = 43,
-    kLumpLightGridHeader = 44,
     kLumpSimpleTriangles = 47,
     kLumpSimpleDrawVerts = 48,
     kLumpSimpleDrawIndices = 49
@@ -187,9 +186,6 @@ struct BspFile {
     string entities;
     vector<BspProbe> probes;
     vector<BspPrimaryLight> primaryLights;
-    bool hasLightGrid = false;
-    unsigned short lightGridMins[3] = {};
-    unsigned short lightGridMaxs[3] = {};
 };
 
 BspFile LoadBsp(const wstring& path);

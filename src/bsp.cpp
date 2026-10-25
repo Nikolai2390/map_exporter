@@ -374,19 +374,6 @@ BspFile LoadBsp(const wstring& path)
         }
     }
 
-    // R_LoadWorldInternal reads LUMP_LIGHTGRIDHEADER only when version > 15.
-    if (version > 15) {
-        if (const Chunk* grid = FindChunk(chunks, kLumpLightGridHeader)) {
-            if (grid->size >= 12) {
-                reader.ReadExact(bsp.lightGridMins, grid->offset, 6);
-                reader.ReadExact(bsp.lightGridMaxs, grid->offset + 6, 6);
-                bsp.hasLightGrid = bsp.lightGridMins[0] <= bsp.lightGridMaxs[0]
-                                && bsp.lightGridMins[1] <= bsp.lightGridMaxs[1]
-                                && bsp.lightGridMins[2] <= bsp.lightGridMaxs[2];
-            }
-        }
-    }
-
     if (bsp.models.empty())
         Fail("bsp has no models");
 

@@ -2789,10 +2789,41 @@ CollKey MakeCollKey(const float a[3], const float b[3], const float c[3])
     return key;
 }
 
+struct CollEdgeKey {
+    int a[3];
+    int b[3];
+    bool operator==(const CollEdgeKey& o) const
+    {
+        return a[0] == o.a[0] && a[1] == o.a[1] && a[2] == o.a[2]
+            && b[0] == o.b[0] && b[1] == o.b[1] && b[2] == o.b[2];
+    }
+};
+
+struct CollEdgeHash {
+    size_t operator()(const CollEdgeKey& k) const
+    {
+        size_t h = 0;
+        for (int i = 0; i < 3; ++i) {
+            h ^= (size_t)k.a[i] * (73856093u + (unsigned)i * 17u);
+            h ^= (size_t)k.b[i] * (19349663u + (unsigned)i * 17u);
+        }
+        return h;
+    }
+};
+
+struct CollThird {
+    float p[3];
+    unsigned contents;
+    bool known;
+};
+
 struct CollisionSet {
     unordered_set<CollKey, CollKeyHash> present;
     unordered_map<CollKey, unsigned, CollKeyHash> contents;
+    unordered_map<CollEdgeKey, vector<CollThird>, CollEdgeHash> edges;
 };
+
+constexpr double kSnapVertDist2 = 1.9083023e-06;
 
 CollisionSet BuildCollisionContents(const BspFile& bsp)
 {
@@ -2876,7 +2907,117 @@ CollisionSet BuildCollisionContents(const BspFile& bsp)
             }
         }
     }
+
+    auto addEdge = [&](const float p0[3], const float p1[3], const float third[3], unsigned cont, bool known) {
+        int q0[3] = { QuantThousand(p0[0]), QuantThousand(p0[1]), QuantThousand(p0[2]) };
+        int q1[3] = { QuantThousand(p1[0]), QuantThousand(p1[1]), QuantThousand(p1[2]) };
+        bool swapEnds = false;
+        for (int i = 0; i < 3; ++i) {
+            if (q0[i] == q1[i])
+                continue;
+            swapEnds = q0[i] > q1[i];
+            break;
+        }
+        CollEdgeKey edge{};
+        memcpy(edge.a, swapEnds ? q1 : q0, sizeof(edge.a));
+        memcpy(edge.b, swapEnds ? q0 : q1, sizeof(edge.b));
+        CollThird ref{};
+        memcpy(ref.p, third, sizeof(ref.p));
+        ref.contents = cont;
+        ref.known = known;
+        set.edges[edge].push_back(ref);
+    };
+    for (const BspCollisionPart& partition : bsp.collisionParts) {
+        for (int t = 0; t < (int)partition.triCount; ++t) {
+            int triIndex = partition.firstTri + t;
+            if (triIndex < 0 || triIndex >= (int)bsp.collisionTris.size())
+                break;
+            const BspCollisionTri& tri = bsp.collisionTris[triIndex];
+            if (tri.v[0] >= bsp.collisionVerts.size() || tri.v[1] >= bsp.collisionVerts.size()
+                || tri.v[2] >= bsp.collisionVerts.size())
+                continue;
+            const float* xyz[3] = {
+                bsp.collisionVerts[tri.v[0]].xyz,
+                bsp.collisionVerts[tri.v[1]].xyz,
+                bsp.collisionVerts[tri.v[2]].xyz
+            };
+            CollKey key = MakeCollKey(xyz[0], xyz[1], xyz[2]);
+            auto found = set.contents.find(key);
+            bool known = found != set.contents.end();
+            unsigned cont = known ? found->second : 0;
+            addEdge(xyz[0], xyz[1], xyz[2], cont, known);
+            addEdge(xyz[1], xyz[2], xyz[0], cont, known);
+            addEdge(xyz[2], xyz[0], xyz[1], cont, known);
+        }
+    }
     return set;
+}
+
+bool CollisionContentsForTriangle(const CollisionSet& set, const float a[3], const float b[3], const float c[3],
+                                  bool& known, unsigned& contents)
+{
+    CollKey key = MakeCollKey(a, b, c);
+    auto exact = set.contents.find(key);
+    if (exact != set.contents.end()) {
+        known = true;
+        contents = exact->second;
+        return true;
+    }
+    if (set.present.count(key)) {
+        known = false;
+        contents = 0;
+        return true;
+    }
+
+    const float* pts[3] = { a, b, c };
+    int q[3][3];
+    for (int i = 0; i < 3; ++i) {
+        q[i][0] = QuantThousand(pts[i][0]);
+        q[i][1] = QuantThousand(pts[i][1]);
+        q[i][2] = QuantThousand(pts[i][2]);
+    }
+    bool found = false;
+    double best = 0;
+    bool bestKnown = false;
+    unsigned bestContents = 0;
+    for (int i = 0; i < 3; ++i) {
+        int j = (i + 1) % 3;
+        int k = (i + 2) % 3;
+        bool swapEnds = false;
+        for (int n = 0; n < 3; ++n) {
+            if (q[i][n] == q[j][n])
+                continue;
+            swapEnds = q[i][n] > q[j][n];
+            break;
+        }
+        CollEdgeKey edge{};
+        memcpy(edge.a, swapEnds ? q[j] : q[i], sizeof(edge.a));
+        memcpy(edge.b, swapEnds ? q[i] : q[j], sizeof(edge.b));
+        auto refs = set.edges.find(edge);
+        if (refs == set.edges.end())
+            continue;
+        for (const CollThird& ref : refs->second) {
+            double dx = (double)ref.p[0] - (double)pts[k][0];
+            double dy = (double)ref.p[1] - (double)pts[k][1];
+            double dz = (double)ref.p[2] - (double)pts[k][2];
+            double dist2 = dx * dx + dy * dy + dz * dz;
+            if (dist2 > kSnapVertDist2)
+                continue;
+            if (found && dist2 > best)
+                continue;
+            if (found && dist2 == best && bestKnown)
+                continue;
+            found = true;
+            best = dist2;
+            bestKnown = ref.known;
+            bestContents = ref.contents;
+        }
+    }
+    if (!found)
+        return false;
+    known = bestKnown;
+    contents = bestContents;
+    return true;
 }
 
 bool PlaneFromFace(const Vec3& a, const Vec3& b, const Vec3& c, PlaneD& out)
@@ -3280,17 +3421,20 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
             if (alpha == 0)
                 continue;
             unsigned contents = soupContents;
-            bool inCollision = false;
-            if (collision) {
-                CollKey collKey = MakeCollKey(bsp.verts[type][ia].xyz, bsp.verts[type][ib].xyz, bsp.verts[type][ic].xyz);
-                if (collision->present.count(collKey)) {
-                    inCollision = true;
-                    auto coll = collision->contents.find(collKey);
-                    if (coll != collision->contents.end()
-                        && IsWeaponClipFlags(coll->second) && !IsWeaponClipFlags(contents))
-                        contents = coll->second;
-                }
-            }
+            unsigned matched = 0;
+            bool known = false;
+            if (collision && CollisionContentsForTriangle(*collision,
+                    bsp.verts[type][ia].xyz, bsp.verts[type][ib].xyz, bsp.verts[type][ic].xyz,
+                    known, matched) && known && IsWeaponClipFlags(matched))
+                contents = matched;
+            if (IsWeaponClipFlags(contents))
+                contents = (unsigned)kContentsClipShot | (unsigned)kContentsMissileClip;
+            else if (contents & (unsigned)kContentsNonColliding)
+                contents = (unsigned)kContentsNonColliding;
+            else if (contents & (unsigned)kContentsDetail)
+                contents = (unsigned)kContentsDetail;
+            else
+                contents = 0;
             if (VerticesOnBrushSides(sideGrid, live, nameId, a, b, c))
                 continue;
 
@@ -4019,28 +4163,6 @@ void AddGridVolumes(vector<BrushOut>& brushes, const vector<GridKey>& points, co
         }
         brushes.push_back(AxisBrush(material, wmin[0], wmin[1], wmin[2], wmax[0], wmax[1], wmax[2]));
     }
-}
-
-vector<BrushOut> BuildLightGridBrushes(const BspFile& bsp, const fs::path& bspPath)
-{
-    vector<BrushOut> brushes;
-    fs::path autoPath = bspPath;
-    fs::path skyPath = bspPath;
-    autoPath.replace_extension(L".grid_auto");
-    skyPath.replace_extension(L".grid_not");
-    AddGridVolumes(brushes, ReadGridPoints(autoPath), "lightgrid_volume");
-    AddGridVolumes(brushes, ReadGridPoints(skyPath), "lightgrid_sky");
-    if (!brushes.empty() || !bsp.hasLightGrid)
-        return brushes;
-
-    brushes.push_back(AxisBrush("lightgrid_volume",
-        GridToWorld(bsp.lightGridMins[0], 0),
-        GridToWorld(bsp.lightGridMins[1], 1),
-        GridToWorld(bsp.lightGridMins[2], 2),
-        GridToWorld(bsp.lightGridMaxs[0], 0),
-        GridToWorld(bsp.lightGridMaxs[1], 1),
-        GridToWorld(bsp.lightGridMaxs[2], 2)));
-    return brushes;
 }
 
 void WriteGeometry(FILE* f, int& brushIndex, const ModelGeo& geo)
@@ -4886,8 +5008,6 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
         for (MeshOut& mesh : models[m].meshes)
             world.meshes.push_back(move(mesh));
     }
-    for (BrushOut& brush : BuildLightGridBrushes(bsp, bspPath))
-        world.brushes.push_back(move(brush));
     stats.probes = (int)bsp.probes.size();
     stats.worldBrushes = (int)world.brushes.size();
     for (int i = 0; i < (int)ents.size(); ++i)
