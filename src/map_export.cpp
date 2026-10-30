@@ -27,9 +27,12 @@ struct PlaneD {
 struct FaceOut {
     Vec3 p[3];
     string material;
-    double scaleS = 64, scaleT = 64;
+    double scaleS = 128, scaleT = 128;
     double shiftS = 0, shiftT = 0;
     double rotate = 0, skew = 0;
+    double lmScaleS = 16384, lmScaleT = 16384;
+    double lmShiftS = 0, lmShiftT = 0;
+    double lmRotate = 0, lmSkew = 0;
 };
 
 struct BrushOut {
@@ -88,12 +91,14 @@ struct Quad {
 
 struct SideGeom {
     int nameId = 0;
+    int drawNameId = 0;
     unsigned surfaceFlags = 0;
     PlaneD plane;
     double mins[3];
     double maxs[3];
     vector<Vec3> winding;
     int faceIndex = -1;
+    int brushIndex = -1;
 };
 
 bool SideIsPortal(unsigned surfaceFlags)
@@ -1178,16 +1183,16 @@ bool ExtractTex(const double planeN[3], double planeDist, double tex[2][4],
     double rotate = atan2(tex[0][t] * p0s, tex[0][s] * p0s) * (180.0 / kPi);
     double shiftS = -tex[0][3] * scaleS;
     double shiftT = -tex[1][3] * scaleT;
-    if (!isfinite(scaleS) || !isfinite(scaleT) || fabs(scaleS) < 0.01 || fabs(scaleT) < 0.01
-        || fabs(scaleS) > 1.0e6 || fabs(scaleT) > 1.0e6)
+    if (!isfinite(scaleS) || !isfinite(scaleT) || !isfinite(shiftS) || !isfinite(shiftT)
+        || !isfinite(rotate) || !isfinite(skew) || scaleS == 0.0 || scaleT == 0.0)
         return false;
 
-    face.scaleS = SnapNear(scaleS);
-    face.scaleT = SnapNear(scaleT);
-    face.shiftS = SnapNear(shiftS);
-    face.shiftT = SnapNear(shiftT);
-    face.rotate = SnapNear(rotate);
-    face.skew = SnapNear(skew);
+    face.scaleS = scaleS;
+    face.scaleT = scaleT;
+    face.shiftS = shiftS;
+    face.shiftT = shiftT;
+    face.rotate = rotate;
+    face.skew = skew;
     return true;
 }
 
@@ -1208,40 +1213,45 @@ bool FitFace(const vector<Hit>& hits, const PlaneD& plane, FaceOut& face)
     int axisU = (~axisDrop) & 1;
     int axisV = (~axisDrop) & 2;
 
-    double m[3][3];
-    double sVal[3];
-    double tVal[3];
-    for (int i = 0; i < 3; ++i) {
-        double xyz[3] = { hits[i].x, hits[i].y, hits[i].z };
-        m[i][0] = xyz[axisU];
-        m[i][1] = xyz[axisV];
-        m[i][2] = 1.0;
-        sVal[i] = hits[i].s;
-        tVal[i] = hits[i].t;
+    double ata[3][3] = {};
+    double atbS[3] = {};
+    double atbT[3] = {};
+    for (const Hit& hit : hits) {
+        double xyz[3] = { hit.x, hit.y, hit.z };
+        double row[3] = { xyz[axisU], xyz[axisV], 1.0 };
+        for (int r = 0; r < 3; ++r) {
+            atbS[r] += row[r] * hit.s;
+            atbT[r] += row[r] * hit.t;
+            for (int c = 0; c < 3; ++c)
+                ata[r][c] += row[r] * row[c];
+        }
     }
+    double solS[3], solT[3];
+    if (!Solve3(ata, atbS, solS) || !Solve3(ata, atbT, solT))
+        return false;
 
     double tex[2][4] = {};
-    auto solveChannel = [&](const double val[3], int channel) -> bool {
-        if (val[0] == val[1] && val[1] == val[2]) {
-            tex[channel][3] = val[0];
-            return true;
-        }
-        double sol[3];
-        if (!Solve3(m, val, sol))
-            return false;
-        tex[channel][axisU] = sol[0];
-        tex[channel][axisV] = sol[1];
-        tex[channel][axisDrop] = 0.0;
-        tex[channel][3] = sol[2];
-        return true;
-    };
-    if (!solveChannel(sVal, 0) || !solveChannel(tVal, 1))
-        return false;
+    tex[0][axisU] = solS[0];
+    tex[0][axisV] = solS[1];
+    tex[0][3] = solS[2];
+    tex[1][axisU] = solT[0];
+    tex[1][axisV] = solT[1];
+    tex[1][3] = solT[2];
 
     double xv[3], yv[3];
     int s = 0, t = 0;
     TextureAxes(plane.n, xv, yv, s, t);
     return ExtractTex(plane.n, plane.dist, tex, xv, yv, s, t, face);
+}
+
+void CopyLightmap(FaceOut& face, const FaceOut& fitted)
+{
+    face.lmScaleS = fitted.scaleS;
+    face.lmScaleT = fitted.scaleT;
+    face.lmShiftS = fitted.shiftS;
+    face.lmShiftT = fitted.shiftT;
+    face.lmRotate = fitted.rotate;
+    face.lmSkew = fitted.skew;
 }
 
 bool MakePlane(const BspFile& bsp, const BspBrushSide& side, int local, const Vec3& origin, PlaneD& out)
@@ -1395,6 +1405,7 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
 
         SideGeom side;
         side.nameId = nameId;
+        side.drawNameId = nameId;
         side.surfaceFlags = surfaceFlags;
         side.plane = planes[local];
         side.faceIndex = (int)brush.faces.size() - 1;
@@ -1611,11 +1622,68 @@ struct SideGrid {
     }
 };
 
-struct TexSample {
-    Vec3 p[3];
-    float st[3][2];
-    double area = 0;
+struct VertUV {
+    Hit albedo;
+    Hit light;
 };
+
+bool ProjectFace(const FaceOut& face, const PlaneD& plane, double x, double y, double z, double& outS, double& outT)
+{
+    if (face.scaleS == 0.0 || face.scaleT == 0.0)
+        return false;
+    double xv[3], yv[3];
+    int s = 0, t = 0;
+    TextureAxes(plane.n, xv, yv, s, t);
+    double rad = face.rotate * (kPi / 180.0);
+    double cs = cos(rad);
+    double sn = sin(rad);
+    double row0[4] = {};
+    double row1[4] = {};
+    row0[s] = xv[s] / face.scaleS * cs;
+    row0[t] = xv[s] / face.scaleS * sn;
+    row1[s] = -sn * (yv[t] / face.scaleT);
+    row1[t] = yv[t] / face.scaleT * cs;
+    for (int i = 0; i < 3; ++i)
+        row0[i] += face.skew * row1[i];
+    row0[3] = -face.shiftS / face.scaleS;
+    row1[3] = -face.shiftT / face.scaleT;
+    double p[3] = { x, y, z };
+    outS = row0[0] * p[0] + row0[1] * p[1] + row0[2] * p[2] + row0[3];
+    outT = row1[0] * p[0] + row1[1] * p[1] + row1[2] * p[2] + row1[3];
+    return true;
+}
+
+bool PickProjection(const vector<Hit>& hits, const PlaneD& plane, FaceOut& face)
+{
+    if (hits.size() < 3)
+        return false;
+    int bestCount = 0;
+    FaceOut best;
+    bool found = false;
+    for (size_t base = 0; base + 2 < hits.size(); base += 3) {
+        vector<Hit> tri(hits.begin() + base, hits.begin() + base + 3);
+        FaceOut trial;
+        if (!FitFace(tri, plane, trial))
+            continue;
+        int count = 0;
+        for (const Hit& hit : hits) {
+            double s = 0, t = 0;
+            if (!ProjectFace(trial, plane, hit.x, hit.y, hit.z, s, t))
+                continue;
+            if (fabs(s - hit.s) <= 1e-3 && fabs(t - hit.t) <= 1e-3)
+                count++;
+        }
+        if (!found || count > bestCount) {
+            found = true;
+            bestCount = count;
+            best = trial;
+        }
+    }
+    if (!found || bestCount < 3)
+        return false;
+    face = best;
+    return true;
+}
 
 void FitAllBrushTextures(const BspFile& bsp, int model, const Vec3& origin, const vector<int>& matName,
                          const Names& names, vector<SideGeom>& sides, vector<BrushOut>& brushes,
@@ -1623,9 +1691,21 @@ void FitAllBrushTextures(const BspFile& bsp, int model, const Vec3& origin, cons
 {
     if (sides.empty())
         return;
+    auto inBrush = [&](int sideIndex, const Vec3& p) {
+        int brush = sides[sideIndex].brushIndex;
+        int i = sideIndex;
+        while (i > 0 && sides[i - 1].brushIndex == brush)
+            --i;
+        for (; i < (int)sides.size() && sides[i].brushIndex == brush; ++i) {
+            if (sides[i].plane.Dist(p) > 0.05)
+                return false;
+        }
+        return true;
+    };
+
     SideGrid grid;
     grid.build(sides);
-    vector<TexSample> best(sides.size());
+    vector<vector<VertUV>> samples(sides.size());
 
     ForSoups(bsp, model, [&](int type, const BspTriSoup& soup) {
         if (soup.materialIndex >= bsp.materials.size() || soup.indexCount < 3)
@@ -1643,28 +1723,25 @@ void FitAllBrushTextures(const BspFile& bsp, int model, const Vec3& origin, cons
             Vec3 a = FromVert(va, origin);
             Vec3 b = FromVert(vb, origin);
             Vec3 c = FromVert(vc, origin);
-            double area = Len(Cross(Sub(b, a), Sub(c, a)));
-            if (area < 0.01)
+            if (Len(Cross(Sub(b, a), Sub(c, a))) < 0.01)
                 continue;
             grid.query(a, b, c, [&](int sideIndex) {
                 const SideGeom& side = sides[sideIndex];
-                if (side.nameId != nameId || side.faceIndex < 0)
+                if ((side.nameId != nameId && side.drawNameId != nameId) || side.faceIndex < 0)
                     return;
-                if (fabs(side.plane.Dist(a)) > kOnPlane || fabs(side.plane.Dist(b)) > kOnPlane || fabs(side.plane.Dist(c)) > kOnPlane)
+                if (fabs(side.plane.Dist(a)) > 0.05 || fabs(side.plane.Dist(b)) > 0.05 || fabs(side.plane.Dist(c)) > 0.05)
                     return;
-                Vec3 n = { side.plane.n[0], side.plane.n[1], side.plane.n[2] };
-                Vec3 mid = Mul(Add(Add(a, b), c), 1.0 / 3.0);
-                if (!InsideConvex(side.winding, mid, n, kInsideSlop))
+                if (!inBrush(sideIndex, a) || !inBrush(sideIndex, b) || !inBrush(sideIndex, c))
                     return;
-                if (area <= best[sideIndex].area)
+                vector<VertUV>& dest = samples[sideIndex];
+                if (dest.size() >= 24)
                     return;
-                TexSample sample;
-                sample.p[0] = a; sample.p[1] = b; sample.p[2] = c;
-                sample.st[0][0] = va.texCoord[0]; sample.st[0][1] = va.texCoord[1];
-                sample.st[1][0] = vb.texCoord[0]; sample.st[1][1] = vb.texCoord[1];
-                sample.st[2][0] = vc.texCoord[0]; sample.st[2][1] = vc.texCoord[1];
-                sample.area = area;
-                best[sideIndex] = sample;
+                dest.push_back({ { a.x, a.y, a.z, va.texCoord[0], va.texCoord[1] },
+                                 { a.x, a.y, a.z, va.lmapCoord[0], va.lmapCoord[1] } });
+                dest.push_back({ { b.x, b.y, b.z, vb.texCoord[0], vb.texCoord[1] },
+                                 { b.x, b.y, b.z, vb.lmapCoord[0], vb.lmapCoord[1] } });
+                dest.push_back({ { c.x, c.y, c.z, vc.texCoord[0], vc.texCoord[1] },
+                                 { c.x, c.y, c.z, vc.lmapCoord[0], vc.lmapCoord[1] } });
             });
         }
     });
@@ -1673,41 +1750,31 @@ void FitAllBrushTextures(const BspFile& bsp, int model, const Vec3& origin, cons
         int begin = brushSideStart[b];
         int end = brushSideStart[b + 1];
         BrushOut& brush = brushes[b];
-        vector<char> fitted(brush.faces.size(), 0);
-        vector<double> faceArea(brush.faces.size(), 0);
         for (int s = begin; s < end; ++s) {
             const SideGeom& side = sides[s];
-            if (best[s].area <= 0.0 || side.faceIndex < 0 || side.faceIndex >= (int)brush.faces.size())
+            if (samples[s].size() < 3 || side.faceIndex < 0 || side.faceIndex >= (int)brush.faces.size())
                 continue;
-            vector<Hit> hits(3);
-            for (int k = 0; k < 3; ++k)
-                hits[k] = { best[s].p[k].x, best[s].p[k].y, best[s].p[k].z, best[s].st[k][0], best[s].st[k][1] };
-            if (!FitFace(hits, side.plane, brush.faces[side.faceIndex]))
-                continue;
-            fitted[side.faceIndex] = 1;
-            faceArea[side.faceIndex] = best[s].area;
-        }
-        for (int face = 0; face < (int)brush.faces.size(); ++face) {
-            if (fitted[face])
-                continue;
-            int donor = -1;
-            double donorArea = 0;
-            for (int other = 0; other < (int)brush.faces.size(); ++other) {
-                if (!fitted[other] || brush.faces[other].material != brush.faces[face].material)
-                    continue;
-                if (faceArea[other] > donorArea) {
-                    donor = other;
-                    donorArea = faceArea[other];
-                }
+            vector<Hit> albedo;
+            vector<Hit> light;
+            albedo.reserve(samples[s].size());
+            light.reserve(samples[s].size());
+            for (const VertUV& vert : samples[s]) {
+                albedo.push_back(vert.albedo);
+                light.push_back(vert.light);
             }
-            if (donor < 0)
-                continue;
-            brush.faces[face].scaleS = brush.faces[donor].scaleS;
-            brush.faces[face].scaleT = brush.faces[donor].scaleT;
-            brush.faces[face].shiftS = brush.faces[donor].shiftS;
-            brush.faces[face].shiftT = brush.faces[donor].shiftT;
-            brush.faces[face].rotate = brush.faces[donor].rotate;
-            brush.faces[face].skew = brush.faces[donor].skew;
+            FaceOut& face = brush.faces[side.faceIndex];
+            FaceOut albedoFit;
+            if (PickProjection(albedo, side.plane, albedoFit)) {
+                face.scaleS = albedoFit.scaleS;
+                face.scaleT = albedoFit.scaleT;
+                face.shiftS = albedoFit.shiftS;
+                face.shiftT = albedoFit.shiftT;
+                face.rotate = albedoFit.rotate;
+                face.skew = albedoFit.skew;
+            }
+            FaceOut lightFit;
+            if (PickProjection(light, side.plane, lightFit))
+                CopyLightmap(face, lightFit);
         }
     }
 }
@@ -1719,30 +1786,32 @@ bool SameCompiledPoint(const Vec3& a, const Vec3& b)
 
 constexpr double kTrisOnEpsilon = 0.1;
 
-bool PointInsideSide(const SideGeom& side, const Vec3& p)
-{
-    if (fabs(side.plane.Dist(p)) > kTrisOnEpsilon)
-        return false;
-    Vec3 n = { side.plane.n[0], side.plane.n[1], side.plane.n[2] };
-    return InsideConvex(side.winding, p, n, kTrisOnEpsilon);
-}
-
-bool VerticesOnBrushSides(SideGrid& grid, const vector<SideGeom>& sides, int nameId,
+bool VerticesOnBrushSides(SideGrid& grid, const vector<SideGeom>& sides,
+                          const vector<vector<int>>& brushSides, int nameId,
                           const Vec3& a, const Vec3& b, const Vec3& c)
 {
-    const Vec3 pts[4] = { a, b, c, Mul(Add(Add(a, b), c), 1.0 / 3.0) };
-    for (const Vec3& p : pts) {
+    auto onBrush = [&](const Vec3& p) {
         bool on = false;
         grid.query(p, p, p, [&](int sideIndex) {
-            if (on || sides[sideIndex].nameId != nameId)
+            if (on)
                 return;
-            if (PointInsideSide(sides[sideIndex], p))
-                on = true;
+            const SideGeom& side = sides[sideIndex];
+            if (side.nameId != nameId && side.drawNameId != nameId)
+                return;
+            if (fabs(side.plane.Dist(p)) > 0.2)
+                return;
+            int brush = side.brushIndex;
+            if (brush < 0 || brush >= (int)brushSides.size())
+                return;
+            for (int other : brushSides[brush]) {
+                if (sides[other].plane.Dist(p) > 0.2)
+                    return;
+            }
+            on = true;
         });
-        if (!on)
-            return false;
-    }
-    return true;
+        return on;
+    };
+    return onBrush(a) && onBrush(b) && onBrush(c);
 }
 
 constexpr double kPatchWeld = 0.001;
@@ -2326,253 +2395,310 @@ void EmitPatchCell(const PatchCell& cell, const vector<WeldVert>& verts, unsigne
     PushPieces(dest, move(mesh), meshCount, vertCount);
 }
 
+int PatchVert(const PatchCell& cell, int index)
+{
+    int id[4] = { cell.A, cell.B, cell.C, cell.D };
+    return id[index];
+}
+
+int LightmapCoordFloor(float v)
+{
+    return (int)floor((double)v * 512.0 - 0.5);
+}
+
+int LightmapCoordCeil(float v)
+{
+    return (int)ceil((double)v * 512.0 + 0.5);
+}
+
+int LightmapExtent(float mn, float mx)
+{
+    return LightmapCoordCeil(mx) + 1 - LightmapCoordFloor(mn);
+}
+
+// SubdivideTerrain rejects a terrain mesh that needs more than 32 lightmap splits.
+bool LightmapSpanSafe(float s0, float s1, float t0, float t1)
+{
+    int w = LightmapExtent(s0, s1);
+    int h = LightmapExtent(t0, t1);
+    int m = w > h ? w : h;
+    if (m <= 512)
+        return true;
+    int splits = (int)ceil((double)m * 0.0021186440717428923);
+    return splits <= 32;
+}
+
 bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& verts, unsigned contents,
                        const string& material, vector<MeshOut>& dest, int& meshCount, int& vertCount)
 {
     if (cells.empty())
         return false;
 
-    struct GV { int u, v; };
-    unordered_map<int, GV> coord;
-    vector<char> placed(cells.size(), 0);
-    coord[cells[0].A] = { 0, 0 };
-    coord[cells[0].B] = { 1, 0 };
-    coord[cells[0].C] = { 1, 1 };
-    coord[cells[0].D] = { 0, 1 };
-    placed[0] = 1;
+    struct GridPos { int u, v; };
+    struct PatchGrid {
+        unordered_map<int, GridPos> vcoord;
+        map<pair<int, int>, int> posVert;
+        map<pair<int, int>, int> occ;
 
-    map<pair<int, int>, vector<pair<int, int>>> edgeCells;
+        bool Place(int cellIndex, const PatchCell& cell, const GridPos corner[4])
+        {
+            int minU = corner[0].u;
+            int minV = corner[0].v;
+            for (int k = 1; k < 4; ++k) {
+                minU = min(minU, corner[k].u);
+                minV = min(minV, corner[k].v);
+            }
+            if (occ.count({ minU, minV }))
+                return false;
+            for (int k = 0; k < 4; ++k) {
+                int id = PatchVert(cell, k);
+                auto known = vcoord.find(id);
+                if (known != vcoord.end()) {
+                    if (known->second.u != corner[k].u || known->second.v != corner[k].v)
+                        return false;
+                } else {
+                    auto at = posVert.find({ corner[k].u, corner[k].v });
+                    if (at != posVert.end() && at->second != id)
+                        return false;
+                }
+            }
+            for (int k = 0; k < 4; ++k) {
+                int id = PatchVert(cell, k);
+                vcoord[id] = corner[k];
+                posVert[{ corner[k].u, corner[k].v }] = id;
+            }
+            occ[{ minU, minV }] = cellIndex;
+            return true;
+        }
+    };
+
+    map<pair<int, int>, vector<int>> edgeCells;
     for (int i = 0; i < (int)cells.size(); ++i) {
-        int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
         for (int e = 0; e < 4; ++e) {
-            int a = id[e];
-            int b = id[(e + 1) % 4];
+            int a = PatchVert(cells[i], e);
+            int b = PatchVert(cells[i], (e + 1) % 4);
             if (a > b)
                 swap(a, b);
-            edgeCells[{ a, b }].push_back({ i, e });
-        }
-    }
-    queue<int> pending;
-    pending.push(0);
-    while (!pending.empty()) {
-        int i = pending.front();
-        pending.pop();
-        int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
-        int cu[4], cv[4];
-        bool have = true;
-        for (int k = 0; k < 4; ++k) {
-            auto at = coord.find(id[k]);
-            if (at == coord.end()) {
-                have = false;
-                break;
-            }
-            cu[k] = at->second.u;
-            cv[k] = at->second.v;
-        }
-        if (!have)
-            continue;
-        for (int e = 0; e < 4; ++e) {
-            int va = id[e];
-            int vb = id[(e + 1) % 4];
-            int ka = va, kb = vb;
-            if (ka > kb)
-                swap(ka, kb);
-            auto found = edgeCells.find({ ka, kb });
-            if (found == edgeCells.end())
-                continue;
-            for (const pair<int, int>& nb : found->second) {
-                int j = nb.first;
-                if (j == i || placed[j])
-                    continue;
-                int nid[4] = { cells[j].A, cells[j].B, cells[j].C, cells[j].D };
-                int e2 = nb.second;
-                int n0 = nid[e2];
-                int n1 = nid[(e2 + 1) % 4];
-                int u0, v0, u1, v1;
-                if (n0 == id[e]) {
-                    u0 = cu[e];
-                    v0 = cv[e];
-                    u1 = cu[(e + 1) % 4];
-                    v1 = cv[(e + 1) % 4];
-                } else {
-                    u0 = cu[(e + 1) % 4];
-                    v0 = cv[(e + 1) % 4];
-                    u1 = cu[e];
-                    v1 = cv[e];
-                }
-                int edx = u1 - u0;
-                int edy = v1 - v0;
-                int sideX[2] = { -edy, edy };
-                int sideY[2] = { edx, -edx };
-                bool seated = false;
-                for (int side = 0; side < 2 && !seated; ++side) {
-                    int nu[4], nv[4];
-                    nu[e2] = u0;
-                    nv[e2] = v0;
-                    nu[(e2 + 1) % 4] = u1;
-                    nv[(e2 + 1) % 4] = v1;
-                    nu[(e2 + 2) % 4] = u1 + sideX[side];
-                    nv[(e2 + 2) % 4] = v1 + sideY[side];
-                    nu[(e2 + 3) % 4] = u0 + sideX[side];
-                    nv[(e2 + 3) % 4] = v0 + sideY[side];
-                    bool ok = true;
-                    for (int k = 0; k < 4 && ok; ++k) {
-                        auto at = coord.find(nid[k]);
-                        if (at != coord.end() && (at->second.u != nu[k] || at->second.v != nv[k]))
-                            ok = false;
-                    }
-                    if (!ok)
-                        continue;
-                    for (int k = 0; k < 4; ++k)
-                        coord[nid[k]] = { nu[k], nv[k] };
-                    placed[j] = 1;
-                    pending.push(j);
-                    seated = true;
-                }
-            }
+            edgeCells[{ a, b }].push_back(i);
         }
     }
 
-    map<pair<int, int>, int> atVert;
-    for (const auto& item : coord)
-        atVert[{ item.second.u, item.second.v }] = item.first;
-
-    map<pair<int, int>, int> occ;
-    vector<int> extra;
-    for (int i = 0; i < (int)cells.size(); ++i) {
-        if (!placed[i])
-            continue;
-        int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
-        int u0 = coord[id[0]].u;
-        int v0 = coord[id[0]].v;
-        for (int k = 1; k < 4; ++k) {
-            u0 = min(u0, coord[id[k]].u);
-            v0 = min(v0, coord[id[k]].v);
-        }
-        pair<int, int> key{ u0, v0 };
-        auto found = occ.find(key);
-        if (found != occ.end() && found->second != i)
-            extra.push_back(i);
-        else
-            occ[key] = i;
-    }
-
-    auto emitRect = [&](int u0, int v0, int cellsW, int cellsH) -> bool {
-        int width = cellsW + 1;
-        int height = cellsH + 1;
-        MeshOut mesh;
-        mesh.contents = contents;
-        mesh.material = material;
-        mesh.width = width;
-        mesh.height = height;
-        mesh.verts.assign((size_t)width * height, MeshVertOut{});
-        for (int v = 0; v < height; ++v) {
-            for (int u = 0; u < width; ++u) {
-                auto found = atVert.find({ u0 + u, v0 + v });
-                if (found == atVert.end())
-                    return false;
-                mesh.verts[(size_t)v * width + u] = ToMeshVert(verts[found->second]);
-            }
-        }
-        for (int cv = 0; cv < cellsH; ++cv) {
-            for (int cu = 0; cu < cellsW; ++cu) {
-                auto found = occ.find({ u0 + cu, v0 + cv });
-                if (found == occ.end())
-                    continue;
-                const PatchCell& cell = cells[found->second];
-                int bu = coord[cell.B].u;
-                int bv = coord[cell.B].v;
-                int du = coord[cell.D].u;
-                int dv = coord[cell.D].v;
-                bool ends[2][2] = {};
-                int eu[2] = { bu, du };
-                int ev[2] = { bv, dv };
-                for (int k = 0; k < 2; ++k) {
-                    int lu = eu[k] - (u0 + cu);
-                    int lv = ev[k] - (v0 + cv);
-                    if (lu >= 0 && lu <= 1 && lv >= 0 && lv <= 1)
-                        ends[lu][lv] = true;
-                }
-                if (ends[0][0] && ends[1][1])
-                    mesh.verts[(size_t)cv * width + cu].flag = 1;
-            }
-        }
-        PushPieces(dest, move(mesh), meshCount, vertCount);
-        return true;
-    };
-
+    vector<char> placed(cells.size(), 0);
     vector<char> emitted(cells.size(), 0);
-    auto markRect = [&](int u0, int v0, int w, int h) {
-        for (int v = 0; v < h; ++v) {
-            for (int u = 0; u < w; ++u) {
-                auto found = occ.find({ u0 + u, v0 + v });
-                if (found != occ.end())
-                    emitted[found->second] = 1;
+
+    auto emitGrid = [&](PatchGrid& grid) {
+        map<pair<int, int>, char> taken;
+
+        auto cornerId = [&](int u, int v) -> int {
+            auto found = grid.posVert.find({ u, v });
+            return found == grid.posVert.end() ? -1 : found->second;
+        };
+        auto lightBounds = [&](int u0, int v0, int cw, int ch, float& s0, float& s1, float& t0, float& t1) -> bool {
+            bool init = false;
+            for (int v = 0; v <= ch; ++v) {
+                for (int u = 0; u <= cw; ++u) {
+                    int id = cornerId(u0 + u, v0 + v);
+                    if (id < 0)
+                        return false;
+                    float s = verts[id].lm[0];
+                    float t = verts[id].lm[1];
+                    if (!init) {
+                        s0 = s1 = s;
+                        t0 = t1 = t;
+                        init = true;
+                    } else {
+                        s0 = min(s0, s);
+                        s1 = max(s1, s);
+                        t0 = min(t0, t);
+                        t1 = max(t1, t);
+                    }
+                }
             }
+            return init;
+        };
+        auto emitRect = [&](int u0, int v0, int cw, int ch) -> bool {
+            int width = cw + 1;
+            int height = ch + 1;
+            if (width > kMaxPatch || height > kMaxPatch)
+                return false;
+            MeshOut mesh;
+            mesh.contents = contents;
+            mesh.material = material;
+            mesh.width = width;
+            mesh.height = height;
+            mesh.verts.assign((size_t)width * height, MeshVertOut{});
+            for (int v = 0; v < height; ++v) {
+                for (int u = 0; u < width; ++u) {
+                    int id = cornerId(u0 + u, v0 + v);
+                    if (id < 0)
+                        return false;
+                    mesh.verts[(size_t)v * width + u] = ToMeshVert(verts[id]);
+                }
+            }
+            for (int cv = 0; cv < ch; ++cv) {
+                for (int cu = 0; cu < cw; ++cu) {
+                    auto found = grid.occ.find({ u0 + cu, v0 + cv });
+                    if (found == grid.occ.end())
+                        return false;
+                    const PatchCell& cell = cells[found->second];
+                    GridPos b = grid.vcoord[cell.B];
+                    GridPos d = grid.vcoord[cell.D];
+                    int bu = b.u - (u0 + cu);
+                    int bv = b.v - (v0 + cv);
+                    int du = d.u - (u0 + cu);
+                    int dv = d.v - (v0 + cv);
+                    if ((bu == 0 && bv == 0 && du == 1 && dv == 1)
+                        || (bu == 1 && bv == 1 && du == 0 && dv == 0))
+                        mesh.verts[(size_t)cv * width + cu].flag = 1;
+                }
+            }
+            PushPieces(dest, move(mesh), meshCount, vertCount);
+            for (int cv = 0; cv < ch; ++cv) {
+                for (int cu = 0; cu < cw; ++cu) {
+                    auto found = grid.occ.find({ u0 + cu, v0 + cv });
+                    if (found != grid.occ.end())
+                        emitted[found->second] = 1;
+                }
+            }
+            return true;
+        };
+
+        for (const auto& item : grid.occ) {
+            if (taken.count(item.first))
+                continue;
+            int u0 = item.first.first;
+            int v0 = item.first.second;
+            int maxW = 0;
+            while (maxW < kMaxPatch - 1) {
+                pair<int, int> key{ u0 + maxW, v0 };
+                if (!grid.occ.count(key) || taken.count(key))
+                    break;
+                ++maxW;
+            }
+            int bestW = 1;
+            int bestH = 1;
+            for (int w = 1; w <= maxW; ++w) {
+                int h = 1;
+                while (h < kMaxPatch - 1) {
+                    bool rowOk = true;
+                    for (int u = 0; u < w && rowOk; ++u) {
+                        pair<int, int> key{ u0 + u, v0 + h };
+                        if (!grid.occ.count(key) || taken.count(key))
+                            rowOk = false;
+                    }
+                    if (!rowOk)
+                        break;
+                    ++h;
+                }
+                int fw = w;
+                int fh = h;
+                float s0, s1, t0, t1;
+                bool fit = false;
+                while (fw >= 1 && fh >= 1) {
+                    if (!lightBounds(u0, v0, fw, fh, s0, s1, t0, t1))
+                        break;
+                    if (fw == 1 && fh == 1) {
+                        fit = true;
+                        break;
+                    }
+                    if (LightmapSpanSafe(s0, s1, t0, t1)) {
+                        fit = true;
+                        break;
+                    }
+                    int se = LightmapExtent(s0, s1);
+                    int te = LightmapExtent(t0, t1);
+                    if (se >= te && fw > 1)
+                        --fw;
+                    else if (fh > 1)
+                        --fh;
+                    else
+                        --fw;
+                }
+                if (!fit)
+                    continue;
+                int area = fw * fh;
+                int bestArea = bestW * bestH;
+                int span = min(fw, fh);
+                int bestSpan = min(bestW, bestH);
+                if (area > bestArea || (area == bestArea && (span > bestSpan || (span == bestSpan && fw > bestW)))) {
+                    bestW = fw;
+                    bestH = fh;
+                }
+            }
+            if (!emitRect(u0, v0, bestW, bestH)) {
+                for (int cv = 0; cv < bestH; ++cv) {
+                    for (int cu = 0; cu < bestW; ++cu) {
+                        auto found = grid.occ.find({ u0 + cu, v0 + cv });
+                        if (found != grid.occ.end() && !emitted[found->second])
+                            EmitPatchCell(cells[found->second], verts, contents, material, dest, meshCount, vertCount);
+                        if (found != grid.occ.end())
+                            emitted[found->second] = 1;
+                    }
+                }
+            }
+            for (int cv = 0; cv < bestH; ++cv)
+                for (int cu = 0; cu < bestW; ++cu)
+                    taken[{ u0 + cu, v0 + cv }] = 1;
         }
     };
-    map<pair<int, int>, char> taken;
-    for (const auto& item : occ)
-        taken[item.first] = 0;
-    for (const auto& item : occ) {
-        if (taken[item.first])
+
+    for (int seed = 0; seed < (int)cells.size(); ++seed) {
+        if (placed[seed])
             continue;
-        vector<pair<int, int>> comp;
-        queue<pair<int, int>> walk;
-        walk.push(item.first);
-        taken[item.first] = 1;
-        while (!walk.empty()) {
-            pair<int, int> cur = walk.front();
-            walk.pop();
-            comp.push_back(cur);
-            const int step[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
-            for (int s = 0; s < 4; ++s) {
-                pair<int, int> nxt{ cur.first + step[s][0], cur.second + step[s][1] };
-                if (!occ.count(nxt) || taken[nxt])
-                    continue;
-                taken[nxt] = 1;
-                walk.push(nxt);
-            }
-        }
-        int minu = comp[0].first, maxu = comp[0].first, minv = comp[0].second, maxv = comp[0].second;
-        for (const pair<int, int>& cell : comp) {
-            minu = min(minu, cell.first);
-            maxu = max(maxu, cell.first);
-            minv = min(minv, cell.second);
-            maxv = max(maxv, cell.second);
-        }
-        int bw = maxu - minu + 1;
-        int bh = maxv - minv + 1;
-        bool filled = (int)comp.size() == bw * bh;
-        if (filled && emitRect(minu, minv, bw, bh)) {
-            markRect(minu, minv, bw, bh);
+        PatchGrid grid;
+        GridPos start[4] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+        if (!grid.Place(seed, cells[seed], start))
             continue;
-        }
-        for (int v = minv; v <= maxv; ++v) {
-            int u = minu;
-            while (u <= maxu) {
-                if (!occ.count({ u, v })) {
-                    ++u;
+        placed[seed] = 1;
+        queue<int> pending;
+        pending.push(seed);
+        while (!pending.empty()) {
+            int ci = pending.front();
+            pending.pop();
+            const PatchCell& cur = cells[ci];
+            for (int e = 0; e < 4; ++e) {
+                int i = PatchVert(cur, e);
+                int j = PatchVert(cur, (e + 1) % 4);
+                GridPos pi = grid.vcoord[i];
+                GridPos pj = grid.vcoord[j];
+                int lo = i < j ? i : j;
+                int hi = i < j ? j : i;
+                auto found = edgeCells.find({ lo, hi });
+                if (found == edgeCells.end())
                     continue;
+                for (int ni : found->second) {
+                    if (ni == ci || placed[ni])
+                        continue;
+                    const PatchCell& nb = cells[ni];
+                    int k = -1;
+                    for (int kk = 0; kk < 4; ++kk) {
+                        if (PatchVert(nb, kk) == j && PatchVert(nb, (kk + 1) % 4) == i)
+                            k = kk;
+                    }
+                    if (k < 0)
+                        continue;
+                    int du = pj.u - pi.u;
+                    int dv = pj.v - pi.v;
+                    int ru = dv;
+                    int rv = -du;
+                    GridPos nc[4];
+                    nc[k] = pj;
+                    nc[(k + 1) % 4] = pi;
+                    nc[(k + 2) % 4] = { pi.u + ru, pi.v + rv };
+                    nc[(k + 3) % 4] = { pj.u + ru, pj.v + rv };
+                    if (grid.Place(ni, nb, nc)) {
+                        placed[ni] = 1;
+                        pending.push(ni);
+                    }
                 }
-                int w = 0;
-                while (occ.count({ u + w, v }))
-                    ++w;
-                if (emitRect(u, v, w, 1))
-                    markRect(u, v, w, 1);
-                else if (emitRect(u, v, 1, 1))
-                    markRect(u, v, 1, 1);
-                u += w;
             }
         }
+        emitGrid(grid);
     }
 
-    for (int cellIndex : extra)
-        EmitPatchCell(cells[cellIndex], verts, contents, material, dest, meshCount, vertCount);
     for (int i = 0; i < (int)cells.size(); ++i) {
-        if (!emitted[i] && extra.end() == find(extra.begin(), extra.end(), i))
-            if (!placed[i] || !emitted[i])
-                EmitPatchCell(cells[i], verts, contents, material, dest, meshCount, vertCount);
+        if (!emitted[i])
+            EmitPatchCell(cells[i], verts, contents, material, dest, meshCount, vertCount);
     }
     return true;
 }
@@ -2641,39 +2767,7 @@ void BuildMeshes(const vector<WeldVert>& verts, const vector<Tri>& tris, unsigne
     };
     take(stCells);
     take(longCells);
-
-    vector<int> parent(cells.size());
-    for (int i = 0; i < (int)cells.size(); ++i)
-        parent[i] = i;
-    auto find = [&](auto&& self, int x) -> int {
-        return parent[x] == x ? x : parent[x] = self(self, parent[x]);
-    };
-    map<pair<int, int>, int> boundary;
-    for (int i = 0; i < (int)cells.size(); ++i) {
-        int id[4] = { cells[i].A, cells[i].B, cells[i].C, cells[i].D };
-        int e[4][2] = { { 0, 1 }, { 1, 2 }, { 2, 3 }, { 3, 0 } };
-        for (int k = 0; k < 4; ++k) {
-            int a = id[e[k][0]];
-            int b = id[e[k][1]];
-            if (a > b)
-                swap(a, b);
-            auto found = boundary.find({ a, b });
-            if (found == boundary.end())
-                boundary[{ a, b }] = i;
-            else {
-                int pa = find(find, i);
-                int pb = find(find, found->second);
-                if (pa != pb)
-                    parent[pa] = pb;
-            }
-        }
-    }
-
-    map<int, vector<PatchCell>> groups;
-    for (int i = 0; i < (int)cells.size(); ++i)
-        groups[find(find, i)].push_back(cells[i]);
-    for (auto& group : groups)
-        EmitStitchedPatch(group.second, verts, contents, material, dest, meshCount, vertCount);
+    EmitStitchedPatch(cells, verts, contents, material, dest, meshCount, vertCount);
     for (int i = 0; i < (int)tris.size(); ++i) {
         if (!used[i])
             EmitLooseTri(tris[i], verts, contents, material, dest, meshCount, vertCount, triMeshes);
@@ -3274,6 +3368,167 @@ void ApplyPortalShapes(const BspFile& bsp, vector<BrushOut>& brushes, vector<Sid
     }
 }
 
+struct StOffset { int s = 0; int t = 0; };
+
+vector<StOffset> TerrainSoupOffsets(const BspFile& bsp, int modelIndex, const Vec3& origin,
+                                    const vector<int>& matName, const Names& names)
+{
+    struct Anchor {
+        int soup;
+        int nameId;
+        Vec3 p;
+        float st[2];
+        float lm[2];
+        unsigned char color[4];
+    };
+    struct Cell {
+        int x, y, z;
+        bool operator==(const Cell& o) const { return x == o.x && y == o.y && z == o.z; }
+    };
+    struct CellHash {
+        size_t operator()(const Cell& k) const
+        {
+            return ((size_t)k.x * 73856093u) ^ ((size_t)k.y * 19349663u) ^ ((size_t)k.z * 83492791u);
+        }
+    };
+    vector<Anchor> anchors;
+    unordered_map<Cell, vector<int>, CellHash> grid;
+    int soupCount = 0;
+    auto cellOf = [](const Vec3& p) {
+        return Cell{ (int)floor(p.x / kPatchWeld), (int)floor(p.y / kPatchWeld), (int)floor(p.z / kPatchWeld) };
+    };
+    auto integerDelta = [](float a, float b, int& d) {
+        double raw = (double)a - (double)b;
+        d = (int)llround(raw);
+        return fabs(raw - (double)d) <= kPatchSt;
+    };
+
+    ForSoups(bsp, modelIndex, [&](int type, const BspTriSoup& soup) {
+        int serial = soupCount++;
+        if (soup.materialIndex >= bsp.materials.size() || soup.indexCount < 3)
+            return;
+        int nameId = MatchNameId(bsp, names, matName, soup.materialIndex);
+        if (nameId < 0)
+            return;
+        unordered_set<int> seen;
+        for (int i = 0; i < soup.indexCount; ++i) {
+            int iv = ResolveVert(soup, bsp.indices[type], i, (int)bsp.verts[type].size());
+            if (iv < 0 || !seen.insert(iv).second)
+                continue;
+            const BspDrawVert& vert = bsp.verts[type][iv];
+            Anchor a;
+            a.soup = serial;
+            a.nameId = nameId;
+            a.p = FromVert(vert, origin);
+            a.st[0] = vert.texCoord[0];
+            a.st[1] = vert.texCoord[1];
+            a.lm[0] = vert.lmapCoord[0];
+            a.lm[1] = vert.lmapCoord[1];
+            memcpy(a.color, vert.color, 4);
+            int id = (int)anchors.size();
+            anchors.push_back(a);
+            grid[cellOf(a.p)].push_back(id);
+        }
+    });
+
+    struct Acc { int ds = 0; int dt = 0; bool bad = false; bool set = false; };
+    map<pair<int, int>, Acc> pairs;
+    for (int ia = 0; ia < (int)anchors.size(); ++ia) {
+        Cell c = cellOf(anchors[ia].p);
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    auto found = grid.find(Cell{ c.x + dx, c.y + dy, c.z + dz });
+                    if (found == grid.end())
+                        continue;
+                    for (int ib : found->second) {
+                        if (ib <= ia)
+                            continue;
+                        const Anchor& a = anchors[ia];
+                        const Anchor& b = anchors[ib];
+                        if (a.soup == b.soup || a.nameId != b.nameId)
+                            continue;
+                        if (fabs(a.p.x - b.p.x) > kPatchWeld || fabs(a.p.y - b.p.y) > kPatchWeld
+                            || fabs(a.p.z - b.p.z) > kPatchWeld)
+                            continue;
+                        if (fabs((double)a.lm[0] - (double)b.lm[0]) > kPatchSt
+                            || fabs((double)a.lm[1] - (double)b.lm[1]) > kPatchSt)
+                            continue;
+                        if (a.color[0] != b.color[0] || a.color[1] != b.color[1]
+                            || a.color[2] != b.color[2] || a.color[3] != b.color[3])
+                            continue;
+                        int lo = a.soup < b.soup ? ia : ib;
+                        int hi = a.soup < b.soup ? ib : ia;
+                        const Anchor& u = anchors[lo];
+                        const Anchor& v = anchors[hi];
+                        int ds = 0, dt = 0;
+                        bool ok = integerDelta(u.st[0], v.st[0], ds) && integerDelta(u.st[1], v.st[1], dt);
+                        Acc& acc = pairs[{ u.soup, v.soup }];
+                        if (!ok) {
+                            acc.bad = true;
+                            continue;
+                        }
+                        if (!acc.set) {
+                            acc.ds = ds;
+                            acc.dt = dt;
+                            acc.set = true;
+                        } else if (acc.ds != ds || acc.dt != dt) {
+                            acc.bad = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct Rel { int other; int ds; int dt; };
+    vector<vector<Rel>> links((size_t)soupCount);
+    for (const auto& item : pairs) {
+        if (!item.second.set || item.second.bad)
+            continue;
+        int lo = item.first.first;
+        int hi = item.first.second;
+        links[lo].push_back({ hi, item.second.ds, item.second.dt });
+        links[hi].push_back({ lo, -item.second.ds, -item.second.dt });
+    }
+
+    vector<StOffset> off((size_t)soupCount);
+    vector<char> known((size_t)soupCount, 0);
+    for (int s = 0; s < soupCount; ++s) {
+        if (known[s])
+            continue;
+        known[s] = 1;
+        vector<int> comp;
+        comp.push_back(s);
+        bool bad = false;
+        queue<int> pending;
+        pending.push(s);
+        while (!pending.empty()) {
+            int cur = pending.front();
+            pending.pop();
+            for (const Rel& rel : links[cur]) {
+                int es = off[cur].s + rel.ds;
+                int et = off[cur].t + rel.dt;
+                if (known[rel.other]) {
+                    if (off[rel.other].s != es || off[rel.other].t != et)
+                        bad = true;
+                    continue;
+                }
+                known[rel.other] = 1;
+                off[rel.other].s = es;
+                off[rel.other].t = et;
+                comp.push_back(rel.other);
+                pending.push(rel.other);
+            }
+        }
+        if (bad) {
+            for (int i : comp)
+                off[i] = {};
+        }
+    }
+    return off;
+}
+
 ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, const vector<int>& matName,
                     const Names& names, int caulk, const CollisionSet* collision,
                     int& dropped, int& meshCount, int& vertCount, int& triMeshes)
@@ -3305,6 +3560,9 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
             dropped++;
             continue;
         }
+        int ordinal = (int)geo.brushes.size();
+        for (SideGeom& side : built.sides)
+            side.brushIndex = ordinal;
         for (SideGeom& side : built.sides)
             allSides.push_back(move(side));
         brushSideStart.push_back((int)allSides.size());
@@ -3316,14 +3574,18 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
         int end = brushSideStart[b + 1];
         for (int i = begin; i < end; ++i) {
             SideGeom& side = allSides[i];
-            if (side.nameId < 0 || side.nameId >= (int)names.list.size())
-                continue;
-            string resolved = ResolveLayered(names.list[side.nameId], bsp);
-            auto found = names.lookup.find(resolved);
-            if (found != names.lookup.end())
-                side.nameId = found->second;
-            if (side.faceIndex >= 0 && side.faceIndex < (int)geo.brushes[b].faces.size())
-                geo.brushes[b].faces[side.faceIndex].material = resolved;
+            auto resolveId = [&](int id) {
+                if (id < 0 || id >= (int)names.list.size())
+                    return id;
+                string resolved = ResolveLayered(names.list[id], bsp);
+                auto found = names.lookup.find(resolved);
+                return found == names.lookup.end() ? id : found->second;
+            };
+            side.drawNameId = resolveId(side.drawNameId);
+            side.nameId = resolveId(side.nameId);
+            if (side.faceIndex >= 0 && side.faceIndex < (int)geo.brushes[b].faces.size()
+                && side.nameId >= 0 && side.nameId < (int)names.list.size())
+                geo.brushes[b].faces[side.faceIndex].material = names.list[side.nameId];
         }
     }
     ApplyPortalShapes(bsp, geo.brushes, allSides, brushSideStart);
@@ -3336,6 +3598,12 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
 
     SideGrid sideGrid;
     sideGrid.build(live);
+    vector<vector<int>> brushSides(geo.brushes.size());
+    for (int i = 0; i < (int)live.size(); ++i) {
+        int brush = live[i].brushIndex;
+        if (brush >= 0 && brush < (int)brushSides.size())
+            brushSides[brush].push_back(i);
+    }
 
     struct WeldCell {
         int x, y, z;
@@ -3351,12 +3619,16 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
     unordered_map<WeldCell, vector<int>, WeldCellHash> weldGrid;
     unordered_map<BucketKey, vector<Tri>, BucketHash> buckets;
     unordered_set<PosKey, PosHash> seenTris;
+    const vector<StOffset> soupOff = TerrainSoupOffsets(bsp, modelIndex, origin, matName, names);
+    int soupSerial = 0;
 
     auto weldCell = [](const Vec3& p) {
         return WeldCell{ (int)floor(p.x / kPatchWeld), (int)floor(p.y / kPatchWeld), (int)floor(p.z / kPatchWeld) };
     };
-    auto weldPoint = [&](const BspDrawVert& vert) -> int {
+    auto weldPoint = [&](const BspDrawVert& vert, StOffset off) -> int {
         Vec3 p = FromVert(vert, origin);
+        double st0 = (double)vert.texCoord[0] + off.s;
+        double st1 = (double)vert.texCoord[1] + off.t;
         WeldCell cell = weldCell(p);
         for (int dx = -1; dx <= 1; ++dx) {
             for (int dy = -1; dy <= 1; ++dy) {
@@ -3369,8 +3641,8 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
                         if (fabs(other.p.x - p.x) > kPatchWeld || fabs(other.p.y - p.y) > kPatchWeld
                             || fabs(other.p.z - p.z) > kPatchWeld)
                             continue;
-                        if (fabs((double)other.st[0] - (double)vert.texCoord[0]) > kPatchSt
-                            || fabs((double)other.st[1] - (double)vert.texCoord[1]) > kPatchSt)
+                        if (fabs((double)other.st[0] - st0) > kPatchSt
+                            || fabs((double)other.st[1] - st1) > kPatchSt)
                             continue;
                         if (fabs((double)other.lm[0] - (double)vert.lmapCoord[0]) > kPatchSt
                             || fabs((double)other.lm[1] - (double)vert.lmapCoord[1]) > kPatchSt)
@@ -3385,8 +3657,8 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
         }
         WeldVert out;
         out.p = p;
-        out.st[0] = vert.texCoord[0];
-        out.st[1] = vert.texCoord[1];
+        out.st[0] = (float)st0;
+        out.st[1] = (float)st1;
         out.lm[0] = vert.lmapCoord[0];
         out.lm[1] = vert.lmapCoord[1];
         out.n[0] = vert.normal[0];
@@ -3400,6 +3672,8 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
     };
 
     ForSoups(bsp, modelIndex, [&](int type, const BspTriSoup& soup) {
+        int serial = soupSerial++;
+        StOffset off = serial < (int)soupOff.size() ? soupOff[serial] : StOffset{};
         if (soup.materialIndex >= bsp.materials.size() || soup.indexCount < 3)
             return;
         int nameId = MatchNameId(bsp, names, matName, soup.materialIndex);
@@ -3435,7 +3709,7 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
                 contents = (unsigned)kContentsDetail;
             else
                 contents = 0;
-            if (VerticesOnBrushSides(sideGrid, live, nameId, a, b, c))
+            if (VerticesOnBrushSides(sideGrid, live, brushSides, nameId, a, b, c))
                 continue;
 
             struct PointKey { int x, y, z; };
@@ -3460,9 +3734,9 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
                 continue;
 
             Tri tri;
-            tri.a = weldPoint(bsp.verts[type][ia]);
-            tri.b = weldPoint(bsp.verts[type][ib]);
-            tri.c = weldPoint(bsp.verts[type][ic]);
+            tri.a = weldPoint(bsp.verts[type][ia], off);
+            tri.b = weldPoint(bsp.verts[type][ib], off);
+            tri.c = weldPoint(bsp.verts[type][ic], off);
             buckets[{ nameId, contents }].push_back(tri);
         }
     });
@@ -3599,21 +3873,41 @@ bool RecoverClosedBrushes(const vector<WeldVert>& verts, const vector<Tri>& tris
         int x, y, z;
         bool operator==(const CornerKey& o) const { return x == o.x && y == o.y && z == o.z; }
     };
-    struct CornerHash {
-        size_t operator()(const CornerKey& k) const
+    struct EdgeKey {
+        int ax, ay, az, bx, by, bz;
+        bool operator==(const EdgeKey& o) const
         {
-            return ((size_t)k.x * 73856093u) ^ ((size_t)k.y * 19349663u) ^ ((size_t)k.z * 83492791u);
+            return ax == o.ax && ay == o.ay && az == o.az && bx == o.bx && by == o.by && bz == o.bz;
         }
     };
-    unordered_map<CornerKey, int, CornerHash> owner;
+    struct EdgeHash {
+        size_t operator()(const EdgeKey& k) const
+        {
+            size_t h = ((size_t)k.ax * 73856093u) ^ ((size_t)k.ay * 19349663u) ^ ((size_t)k.az * 83492791u);
+            h ^= ((size_t)k.bx * 73856093u) ^ ((size_t)k.by * 19349663u) ^ ((size_t)k.bz * 83492791u);
+            return h;
+        }
+    };
+    auto cornerOf = [&](int id) {
+        const Vec3& point = verts[id].p;
+        return CornerKey{ (int)llround(point.x * 100.0), (int)llround(point.y * 100.0), (int)llround(point.z * 100.0) };
+    };
+    unordered_map<EdgeKey, int, EdgeHash> edgeOwner;
     for (int i = 0; i < (int)tris.size(); ++i) {
         int ids[3] = { tris[i].a, tris[i].b, tris[i].c };
-        for (int id : ids) {
-            const Vec3& point = verts[id].p;
-            CornerKey key{ (int)llround(point.x * 100.0), (int)llround(point.y * 100.0), (int)llround(point.z * 100.0) };
-            auto found = owner.find(key);
-            if (found == owner.end())
-                owner[key] = i;
+        for (int k = 0; k < 3; ++k) {
+            CornerKey c0 = cornerOf(ids[k]);
+            CornerKey c1 = cornerOf(ids[(k + 1) % 3]);
+            EdgeKey edge{ c0.x, c0.y, c0.z, c1.x, c1.y, c1.z };
+            if (edge.bx < edge.ax || (edge.bx == edge.ax && edge.by < edge.ay)
+                || (edge.bx == edge.ax && edge.by == edge.ay && edge.bz < edge.az)) {
+                swap(edge.ax, edge.bx);
+                swap(edge.ay, edge.by);
+                swap(edge.az, edge.bz);
+            }
+            auto found = edgeOwner.find(edge);
+            if (found == edgeOwner.end())
+                edgeOwner[edge] = i;
             else {
                 int a = find(find, i);
                 int b = find(find, found->second);
@@ -3671,7 +3965,7 @@ bool RecoverClosedBrushes(const vector<WeldVert>& verts, const vector<Tri>& tris
                 planes[found->second].tris.push_back(ti);
             }
         }
-        if (bad || planes.size() < 4 || planes.size() > 32)
+        if (bad || planes.size() < 4 || planes.size() > 128)
             continue;
 
         BrushOut brush;
@@ -3746,7 +4040,9 @@ bool RecoverClosedBrushes(const vector<WeldVert>& verts, const vector<Tri>& tris
         if (!inside)
             continue;
         for (int axis = 0; axis < 3; ++axis) {
-            if (bmin[axis] < pmin[axis] - 2.0 || bmax[axis] > pmax[axis] + 2.0)
+            double span = max(1.0, pmax[axis] - pmin[axis]);
+            double pad = max(8.0, span * 0.5);
+            if (bmin[axis] < pmin[axis] - pad || bmax[axis] > pmax[axis] + pad)
                 inside = false;
         }
         if (!inside)
@@ -3999,7 +4295,14 @@ void WriteBrush(FILE* f, int index, const BrushOut& brush)
         WriteNum(f, face.shiftT); fputc(' ', f);
         WriteNum(f, face.rotate); fputc(' ', f);
         WriteNum(f, face.skew);
-        fputs(" lightmap_gray 16384 16384 0 0 0 0\n", f);
+        fputs(" lightmap_gray ", f);
+        WriteNum(f, face.lmScaleS); fputc(' ', f);
+        WriteNum(f, face.lmScaleT); fputc(' ', f);
+        WriteNum(f, face.lmShiftS); fputc(' ', f);
+        WriteNum(f, face.lmShiftT); fputc(' ', f);
+        WriteNum(f, face.lmRotate); fputc(' ', f);
+        WriteNum(f, face.lmSkew);
+        fputc('\n', f);
     }
     fputs("}\n", f);
 }
