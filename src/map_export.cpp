@@ -5614,21 +5614,62 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
         claim(i, StarModel(KeyOf(ents[i], "physicsmodel")));
     }
 
+    auto coveredByWorld = [&](int model) {
+        const BspModel& world = bsp.models[0];
+        const BspModel& other = bsp.models[model];
+        bool any = false;
+        if (other.numBrushes > 0) {
+            if (other.firstBrush < world.firstBrush
+                || other.firstBrush + other.numBrushes > world.firstBrush + world.numBrushes)
+                return false;
+            any = true;
+        }
+        for (int type = 0; type < 2; ++type) {
+            if (other.triSoupCount[type] == 0)
+                continue;
+            if (other.firstTriSoup[type] < world.firstTriSoup[type]
+                || other.firstTriSoup[type] + other.triSoupCount[type]
+                    > world.firstTriSoup[type] + world.triSoupCount[type])
+                return false;
+            any = true;
+        }
+        if (other.numSurfaces > 0) {
+            if (other.firstSurface < world.firstSurface
+                || other.firstSurface + other.numSurfaces > world.firstSurface + world.numSurfaces)
+                return false;
+            any = true;
+        }
+        return any;
+    };
+
+    vector<char> skipModel(bsp.models.size(), 0);
     vector<int> orphans;
-    for (int m = 1; m < (int)bsp.models.size(); ++m)
-        if (!claimed[m])
-            orphans.push_back(m);
+    int covered = 0;
+    for (int m = 1; m < (int)bsp.models.size(); ++m) {
+        if (claimed[m])
+            continue;
+        if (coveredByWorld(m)) {
+            skipModel[m] = 1;
+            covered++;
+            continue;
+        }
+        orphans.push_back(m);
+    }
 
     ExportStats stats;
     stats.version = bsp.version;
     stats.probes = (int)bsp.probes.size();
     if (!orphans.empty())
         stats.warning = "unreferenced brush models were merged into the geo map";
+    if (covered)
+        cout << "skipped " << covered << " models already covered by the world" << endl;
 
     gDropSides = gDropMat = gDropPlane = gDropFaces = gDropSolid = 0;
     const CollisionSet collisionContents = BuildCollisionContents(bsp);
     vector<ModelGeo> models(bsp.models.size());
     for (int m = 0; m < (int)bsp.models.size(); ++m) {
+        if (skipModel[m])
+            continue;
         cout << "model " << m << "/" << bsp.models.size() << endl;
         models[m] = BuildModel(bsp, m, origins[m], matName, names, caulk, &collisionContents,
                                stats.droppedBrushes, stats.meshes, stats.meshVerts, stats.triangleMeshes);
