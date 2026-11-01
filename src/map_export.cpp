@@ -100,6 +100,9 @@ struct SideGeom {
     vector<Vec3> winding;
     int faceIndex = -1;
     int brushIndex = -1;
+    // Source plane with its direction folded out (float bits) and this side's direction along it.
+    uint32_t planeKey[4] = {};
+    int planeSign = 0;
 };
 
 bool SideIsPortal(unsigned surfaceFlags)
@@ -214,12 +217,11 @@ vector<Vec3> BaseWinding(const PlaneD& plane)
     return w;
 }
 
-vector<Vec3> ClipWinding(const vector<Vec3>& in, const PlaneD& plane)
+vector<Vec3> ClipWinding(const vector<Vec3>& in, const PlaneD& plane, double eps = 0.05)
 {
     vector<Vec3> out;
     if (in.empty())
         return out;
-    const double eps = 0.05;
     for (size_t i = 0; i < in.size(); ++i) {
         const Vec3& a = in[i];
         const Vec3& b = in[(i + 1) % in.size()];
@@ -1534,6 +1536,40 @@ bool MakePlane(const BspFile& bsp, const BspBrushSide& side, int local, const Ve
     return true;
 }
 
+// Brushes touching face to face reference exactly negated planes, so folding the direction out of the
+// stored floats gives every face on one source plane the same key. Returns the side's direction.
+int SourcePlaneKey(const BspFile& bsp, const BspBrushSide& side, int local, uint32_t key[4])
+{
+    float v[4] = {};
+    int sign = 1;
+    if (local < 6) {
+        memcpy(&v[3], &side.planeOrDist, sizeof(float));
+        v[local >> 1] = 1.f;
+        sign = (local & 1) ? 1 : -1;
+    } else {
+        if (side.planeOrDist >= bsp.planes.size())
+            return 0;
+        const BspPlane& src = bsp.planes[side.planeOrDist];
+        v[0] = src.normal[0];
+        v[1] = src.normal[1];
+        v[2] = src.normal[2];
+        v[3] = src.dist;
+        for (int i = 0; i < 3; ++i) {
+            if (v[i] != 0.f) {
+                sign = v[i] > 0.f ? 1 : -1;
+                break;
+            }
+        }
+        for (float& c : v)
+            c *= (float)sign;
+    }
+    for (int i = 0; i < 4; ++i) {
+        float c = v[i] == 0.f ? 0.f : v[i];
+        memcpy(&key[i], &c, sizeof(float));
+    }
+    return sign;
+}
+
 struct Names {
     vector<string> list;
     unordered_map<string, int> lookup;
@@ -1689,6 +1725,184 @@ vector<Vec3> HullOnPlane(vector<Vec3> points, const PlaneD& plane)
     return hull;
 }
 
+static int gBevelDrop = 0;
+static int gFaceRepick = 0;
+
+double WindingArea(const vector<Vec3>& w)
+{
+    Vec3 sum{ 0, 0, 0 };
+    for (size_t i = 1; i + 1 < w.size(); ++i)
+        sum = Add(sum, Cross(Sub(w[i], w[0]), Sub(w[i + 1], w[0])));
+    return 0.5 * Len(sum);
+}
+
+double WindingWidth(const vector<Vec3>& w)
+{
+    double reach = 0;
+    for (size_t i = 0; i < w.size(); ++i)
+        for (size_t j = i + 1; j < w.size(); ++j)
+            reach = max(reach, Len(Sub(w[i], w[j])));
+    return reach > 0 ? 2.0 * WindingArea(w) / reach : 0.0;
+}
+
+constexpr double kExactClip = 1e-6;
+// A side whose removal lets the brush grow no further than this past its plane adds nothing to the shape.
+constexpr double kBevelSlack = 0.01;
+// Face points whose parsed plane stays this close to the source plane over the face are kept as found.
+constexpr double kPlaneFit = 0.002;
+
+void ClipBrushWindings(const vector<PlaneD>& planes, const vector<char>& active, vector<vector<Vec3>>& out)
+{
+    const int n = (int)planes.size();
+    out.assign(n, {});
+    for (int i = 0; i < n; ++i) {
+        if (!active[i])
+            continue;
+        vector<Vec3> w = BaseWinding(planes[i]);
+        for (int j = 0; j < n && w.size() >= 3; ++j) {
+            if (j != i && active[j])
+                w = ClipWinding(w, planes[j], kExactClip);
+        }
+        if (w.size() >= 3 && WindingArea(w) > 1e-6)
+            out[i] = move(w);
+    }
+}
+
+// The BSP keeps a brush's own sides plus the axial and edge bevels the compiler added. Faces come from
+// the exact solid of those planes; a side is dropped only when the solid without it stays within
+// kBevelSlack of every dropped plane.
+void ExactBrushWindings(const vector<PlaneD>& planes, vector<vector<Vec3>>& windings)
+{
+    const int n = (int)planes.size();
+    vector<char> active(n, 1);
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < i && active[i]; ++j) {
+            if (!active[j])
+                continue;
+            double dot = planes[i].n[0] * planes[j].n[0] + planes[i].n[1] * planes[j].n[1] + planes[i].n[2] * planes[j].n[2];
+            if (dot > 1.0 - 1e-12 && fabs(planes[i].dist - planes[j].dist) < kExactClip)
+                active[i] = 0;
+        }
+    }
+    ClipBrushWindings(planes, active, windings);
+    vector<pair<double, int>> thin;
+    for (int i = 0; i < n; ++i) {
+        if (!active[i])
+            continue;
+        if (windings[i].empty()) {
+            active[i] = 0;
+            continue;
+        }
+        double area = WindingArea(windings[i]);
+        if (area < 1.0 || WindingWidth(windings[i]) < 0.5)
+            thin.push_back({ area, i });
+    }
+    sort(thin.begin(), thin.end());
+    vector<int> dropped;
+    vector<vector<Vec3>> trial;
+    for (const auto& item : thin) {
+        const int i = item.second;
+        active[i] = 0;
+        ClipBrushWindings(planes, active, trial);
+        double grow = 0;
+        for (const vector<Vec3>& w : trial) {
+            for (const Vec3& p : w) {
+                grow = max(grow, planes[i].Dist(p));
+                for (int d : dropped)
+                    grow = max(grow, planes[d].Dist(p));
+            }
+        }
+        if (grow <= kBevelSlack) {
+            dropped.push_back(i);
+            windings.swap(trial);
+            ++gBevelDrop;
+        } else {
+            active[i] = 1;
+        }
+    }
+}
+
+// Largest distance from the source plane, over the face's corners, of the plane the tools parse from tri.
+double ParsedPlaneError(const PlaneD& plane, const vector<Vec3>& winding, const Vec3 tri[3])
+{
+    float p0[3], p1[3], p2[3], parsed[4];
+    LoadFacePoint(tri[0], p0);
+    LoadFacePoint(tri[1], p1);
+    LoadFacePoint(tri[2], p2);
+    if (!PlaneFromFacePoints(p0, p1, p2, parsed))
+        return 1e30;
+    if (parsed[0] * plane.n[0] + parsed[1] * plane.n[1] + parsed[2] * plane.n[2] < 0.99)
+        return 1e30;
+    double worst = 0;
+    for (const Vec3& w : winding)
+        worst = max(worst, fabs((double)parsed[0] * w.x + (double)parsed[1] * w.y + (double)parsed[2] * w.z - parsed[3]));
+    return worst;
+}
+
+// Keeps FacePoints' triangle when it parses back onto the face; otherwise the corner triple or spread
+// points on the source plane whose parsed plane stays closest to the face.
+bool ChooseFacePoints(const PlaneD& plane, const vector<Vec3>& winding, Vec3 out[3])
+{
+    double best = 1e30;
+    Vec3 tri[3];
+    if (FacePoints(winding, plane, tri)) {
+        best = ParsedPlaneError(plane, winding, tri);
+        out[0] = tri[0];
+        out[1] = tri[1];
+        out[2] = tri[2];
+        if (best <= kPlaneFit)
+            return true;
+    }
+    const double baseline = best;
+    const Vec3 n = { plane.n[0], plane.n[1], plane.n[2] };
+    auto consider = [&](Vec3 cand[3]) {
+        if (Dot(PlaneFromPointsNormal(cand[0], cand[1], cand[2]), n) < 0.0)
+            swap(cand[1], cand[2]);
+        double err = ParsedPlaneError(plane, winding, cand);
+        if (err < best - 1e-9) {
+            best = err;
+            out[0] = cand[0];
+            out[1] = cand[1];
+            out[2] = cand[2];
+        }
+    };
+    const int count = (int)winding.size();
+    if (count <= 24) {
+        for (int i = 0; i < count; ++i) {
+            for (int j = i + 1; j < count; ++j) {
+                for (int k = j + 1; k < count; ++k) {
+                    Vec3 cand[3] = { winding[i], winding[j], winding[k] };
+                    consider(cand);
+                }
+            }
+        }
+    }
+    vector<Vec3> anchors;
+    Vec3 mid{ 0, 0, 0 };
+    for (const Vec3& p : winding)
+        mid = Add(mid, p);
+    anchors.push_back(Mul(mid, 1.0 / max(count, 1)));
+    for (int i = 0; i < count && i < 8; ++i)
+        anchors.push_back(winding[i]);
+    static const float spans[] = { 64.f, 256.f, 1024.f, 4096.f };
+    static const float spins[] = { 0.f, 0.6f, 1.2f };
+    for (const Vec3& anchor : anchors) {
+        Vec3 onPlane = Sub(anchor, Mul(n, plane.Dist(anchor)));
+        for (float span : spans) {
+            for (float spin : spins) {
+                Vec3 cand[3];
+                if (PointsOnPlane(plane, onPlane, span, spin, cand))
+                    consider(cand);
+            }
+        }
+    }
+    if (best >= 1e30)
+        return false;
+    if (best < baseline)
+        ++gFaceRepick;
+    return true;
+}
+
 bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& origin,
                 const vector<int>& matName, const Names& names, int caulk,
                 const vector<int>& edgeStart, BrushOut& brush, BuiltSides& sides)
@@ -1713,6 +1927,45 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
 
     brush.contents = bsp.materials[src.materialNum].contentFlags;
     brush.faces.clear();
+
+    bool portalSides = false;
+    for (int local = 0; local < src.numSides; ++local) {
+        unsigned matNum = bsp.sides[sideStart + local].materialNum;
+        if (matNum < bsp.materials.size() && SideIsPortal(bsp.materials[matNum].surfaceFlags))
+            portalSides = true;
+    }
+    vector<vector<Vec3>> exact;
+    if (!portalSides)
+        ExactBrushWindings(planes, exact);
+
+    auto addFace = [&](int local, const Vec3 tri[3], vector<Vec3>& winding) {
+        FaceOut face;
+        face.p[0] = tri[0];
+        face.p[1] = tri[1];
+        face.p[2] = tri[2];
+        unsigned matNum = bsp.sides[sideStart + local].materialNum;
+        int nameId = caulk;
+        unsigned surfaceFlags = 0;
+        if (matNum < bsp.materials.size()) {
+            nameId = matName[matNum];
+            surfaceFlags = bsp.materials[matNum].surfaceFlags;
+        }
+        if (nameId < 0 || nameId >= (int)names.list.size())
+            nameId = caulk;
+        face.material = names.list[nameId];
+        brush.faces.push_back(face);
+
+        SideGeom side;
+        side.nameId = nameId;
+        side.drawNameId = nameId;
+        side.surfaceFlags = surfaceFlags;
+        side.plane = planes[local];
+        side.faceIndex = (int)brush.faces.size() - 1;
+        side.planeSign = SourcePlaneKey(bsp, bsp.sides[sideStart + local], local, side.planeKey);
+        BoundsOf(winding, side.mins, side.maxs);
+        side.winding = move(winding);
+        sides.sides.push_back(move(side));
+    };
 
     struct Corner {
         Vec3 p;
@@ -1749,6 +2002,18 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
     };
 
     for (int local = 0; local < src.numSides; ++local) {
+        if (!portalSides) {
+            vector<Vec3>& winding = exact[local];
+            OrientWinding(winding, planes[local]);
+            Vec3 tri[3];
+            if (winding.size() < 3 || !ChooseFacePoints(planes[local], winding, tri)) {
+                ++gWindingSkip;
+                continue;
+            }
+            StabilizeFacePoints(planes[local], winding, tri);
+            addFace(local, tri, winding);
+            continue;
+        }
         vector<Vec3> winding;
         int sideIndex = sideStart + local;
         int e0 = (sideIndex < (int)edgeStart.size()) ? edgeStart[sideIndex] : 0;
@@ -1802,32 +2067,7 @@ bool BuildBrush(const BspFile& bsp, int brushIndex, int sideStart, const Vec3& o
             continue;
         }
         StabilizeFacePoints(planes[local], winding, tri);
-
-        FaceOut face;
-        face.p[0] = tri[0];
-        face.p[1] = tri[1];
-        face.p[2] = tri[2];
-        unsigned matNum = bsp.sides[sideStart + local].materialNum;
-        int nameId = caulk;
-        unsigned surfaceFlags = 0;
-        if (matNum < bsp.materials.size()) {
-            nameId = matName[matNum];
-            surfaceFlags = bsp.materials[matNum].surfaceFlags;
-        }
-        if (nameId < 0 || nameId >= (int)names.list.size())
-            nameId = caulk;
-        face.material = names.list[nameId];
-        brush.faces.push_back(face);
-
-        SideGeom side;
-        side.nameId = nameId;
-        side.drawNameId = nameId;
-        side.surfaceFlags = surfaceFlags;
-        side.plane = planes[local];
-        side.faceIndex = (int)brush.faces.size() - 1;
-        BoundsOf(winding, side.mins, side.maxs);
-        side.winding = move(winding);
-        sides.sides.push_back(move(side));
+        addFace(local, tri, winding);
     }
 
     bool hasPortalBit = false;
@@ -4544,6 +4784,33 @@ vector<Vec3> HullOnPlane(const vector<Vec3>& points, const Vec3& normal)
     return out.size() >= 3 ? out : vector<Vec3>{};
 }
 
+// Neighbor bevels may shave a compiled face by up to 0.1.
+constexpr double kPortalFit = 0.15;
+
+// True when every point lies inside the convex winding w (on normal n) within tol.
+bool WindingHoldsPoints(const vector<Vec3>& w, const Vec3& n, const vector<Vec3>& pts, double tol)
+{
+    if (w.size() < 3)
+        return false;
+    Vec3 turn{ 0, 0, 0 };
+    for (size_t i = 0; i < w.size(); ++i)
+        turn = Add(turn, Cross(w[i], w[(i + 1) % w.size()]));
+    const double sign = Dot(turn, n) >= 0 ? 1.0 : -1.0;
+    for (size_t i = 0; i < w.size(); ++i) {
+        const Vec3& a = w[i];
+        Vec3 out = Mul(Cross(Sub(w[(i + 1) % w.size()], a), n), sign);
+        const double len = Len(out);
+        if (len < 1e-9)
+            continue;
+        out = Mul(out, 1.0 / len);
+        for (const Vec3& p : pts) {
+            if (Dot(Sub(p, a), out) > tol)
+                return false;
+        }
+    }
+    return true;
+}
+
 void ApplyPortalShapes(const BspFile& bsp, vector<BrushOut>& brushes, vector<SideGeom>& allSides,
                        vector<int>& brushSideStart)
 {
@@ -4592,29 +4859,38 @@ void ApplyPortalShapes(const BspFile& bsp, vector<BrushOut>& brushes, vector<Sid
     if (lumps.empty())
         return;
 
+    // The portal lump holds each source portal face's winding, and removed collision sides only grow a
+    // compiled face, so the owner is the smallest compiled portal face on the plane that contains it.
     for (int b = 0; b < (int)brushes.size(); ++b) {
         int begin = brushSideStart[b];
         int end = brushSideStart[b + 1];
         for (int s = begin; s < end; ++s) {
-            if (!SideIsPortal(allSides[s].surfaceFlags))
+            const SideGeom& side = allSides[s];
+            if (!SideIsPortal(side.surfaceFlags) || side.winding.size() < 3)
                 continue;
+            const Vec3 n{ side.plane.n[0], side.plane.n[1], side.plane.n[2] };
+            const double area = WindingArea(side.winding);
             for (LumpFace& lump : lumps) {
-                if (!SamePortalPlane(allSides[s].plane, lump.plane))
+                if (area >= lump.score || !SamePortalPlane(side.plane, lump.plane))
                     continue;
-                Vec3 mid{ 0, 0, 0 };
-                if (!allSides[s].winding.empty()) {
-                    for (const Vec3& p : allSides[s].winding)
-                        mid = Add(mid, p);
-                    mid = Mul(mid, 1.0 / (double)allSides[s].winding.size());
-                }
-                double dist = Len(Sub(lump.centroid, mid));
-                if (dist >= lump.score)
+                if (!WindingHoldsPoints(side.winding, n, lump.winding, kPortalFit))
                     continue;
-                lump.score = dist;
+                lump.score = area;
                 lump.owner = b;
                 lump.ownerSide = s;
             }
         }
+    }
+
+    // A compiled brush whose portal faces still match the source windings lost no sides.
+    vector<char> reshaped(brushes.size(), 0);
+    for (const LumpFace& lump : lumps) {
+        if (lump.owner < 0 || lump.ownerSide < 0)
+            continue;
+        const SideGeom& side = allSides[lump.ownerSide];
+        const Vec3 n{ side.plane.n[0], side.plane.n[1], side.plane.n[2] };
+        if (!WindingHoldsPoints(lump.winding, n, side.winding, kPortalFit))
+            reshaped[lump.owner] = 1;
     }
 
     auto sameSpot = [](const LumpFace& a, const LumpFace& b) {
@@ -4652,6 +4928,8 @@ void ApplyPortalShapes(const BspFile& bsp, vector<BrushOut>& brushes, vector<Sid
         kept.push_back(lump);
 
         int b = lump.owner;
+        if (!reshaped[b])
+            continue;
         int bestSide = lump.ownerSide;
         int begin = brushSideStart[b];
         int end = brushSideStart[b + 1];
@@ -4878,6 +5156,264 @@ vector<StOffset> TerrainSoupOffsets(const BspFile& bsp, int modelIndex, const Ve
     return off;
 }
 
+static int gShareGroups = 0;
+static int gShareFaces = 0;
+static int gShareMiss = 0;
+
+bool QuickExactCoord(double v)
+{
+    const double r = round(v);
+    if (fabs(v - r) < 1e-4)
+        return v == r;
+    return fabs(v) >= 16.0 || ExactFaceCoord(v);
+}
+
+// A point near target that loads back exactly and sits as close to the source plane as float
+// coordinates allow: the two minor coordinates are nudged and the dominant one solved.
+bool PreciseOnPlane(const PlaneD& plane, const Vec3& target, Vec3& out)
+{
+    const int a = DominantAxis(plane.n);
+    const int b = (a + 1) % 3;
+    const int c = (a + 2) % 3;
+    const double t[3] = { target.x, target.y, target.z };
+    double best = 1e30;
+    uint32_t seed = 2654435761u;
+    for (int k = 0; k < 48; ++k) {
+        double ob = 0, oc = 0;
+        if (k > 0) {
+            seed = seed * 1664525u + 1013904223u;
+            ob = (double)(seed >> 8) / 16777216.0 - 0.5;
+            seed = seed * 1664525u + 1013904223u;
+            oc = (double)(seed >> 8) / 16777216.0 - 0.5;
+        }
+        double p[3];
+        p[b] = (float)(t[b] + ob);
+        p[c] = (float)(t[c] + oc);
+        p[a] = (float)((plane.dist - plane.n[b] * p[b] - plane.n[c] * p[c]) / plane.n[a]);
+        if (fabs(p[0]) > 120000.0 || fabs(p[1]) > 120000.0 || fabs(p[2]) > 120000.0)
+            return false;
+        if (!QuickExactCoord(p[0]) || !QuickExactCoord(p[1]) || !QuickExactCoord(p[2]))
+            continue;
+        const double err = fabs(plane.n[0] * p[0] + plane.n[1] * p[1] + plane.n[2] * p[2] - plane.dist);
+        if (err < best) {
+            best = err;
+            out = { p[0], p[1], p[2] };
+            if (err == 0.0)
+                break;
+        }
+    }
+    return best < 1e30;
+}
+
+bool PreciseFacePoints(const PlaneD& plane, const Vec3& anchor, double span, double spin, Vec3 out[3])
+{
+    const Vec3 n = { plane.n[0], plane.n[1], plane.n[2] };
+    const Vec3 helper = fabs(n.z) < 0.9 ? Vec3{ 0, 0, 1 } : Vec3{ 1, 0, 0 };
+    Vec3 u = Cross(n, helper);
+    const double ulen = Len(u);
+    if (ulen < 1e-12)
+        return false;
+    u = Mul(u, 1.0 / ulen);
+    const Vec3 v = Cross(n, u);
+    const Vec3 ur = Add(Mul(u, cos(spin)), Mul(v, sin(spin)));
+    const Vec3 vr = Sub(Mul(v, cos(spin)), Mul(u, sin(spin)));
+    const Vec3 base = Sub(anchor, Mul(n, plane.Dist(anchor)));
+    const Vec3 target[3] = { base, Add(base, Mul(ur, span)), Add(base, Mul(vr, span)) };
+    for (int i = 0; i < 3; ++i) {
+        if (!PreciseOnPlane(plane, target[i], out[i]))
+            return false;
+    }
+    if (Dot(PlaneFromPointsNormal(out[0], out[1], out[2]), n) < 0.0)
+        swap(out[1], out[2]);
+    return true;
+}
+
+// Faces of different brushes on one source plane get one set of points, reordered for the opposite
+// direction, so the tools load the same plane on both sides of every seam.
+void ShareSourcePlanes(vector<SideGeom>& sides, vector<BrushOut>& brushes)
+{
+    map<pair<uint64_t, uint64_t>, vector<int>> groups;
+    for (int s = 0; s < (int)sides.size(); ++s) {
+        const SideGeom& side = sides[s];
+        if (side.planeSign == 0 || side.winding.size() < 3 || side.brushIndex < 0
+            || side.brushIndex >= (int)brushes.size())
+            continue;
+        const BrushOut& brush = brushes[side.brushIndex];
+        if (brush.portal || side.faceIndex < 0 || side.faceIndex >= (int)brush.faces.size())
+            continue;
+        const uint64_t hi = ((uint64_t)side.planeKey[0] << 32) | side.planeKey[1];
+        const uint64_t lo = ((uint64_t)side.planeKey[2] << 32) | side.planeKey[3];
+        groups[{ hi, lo }].push_back(s);
+    }
+    auto loaded = [](const Vec3 tri[3], float out[4]) {
+        float p0[3], p1[3], p2[3];
+        LoadFacePoint(tri[0], p0);
+        LoadFacePoint(tri[1], p1);
+        LoadFacePoint(tri[2], p2);
+        return PlaneFromFacePoints(p0, p1, p2, out);
+    };
+    // Orders facing the other way: (p0, p2, p1) keeps cod4map's base point and loads the exact negation;
+    // (p1, p0, p2) also keeps the exact tie TiedFacePoints builds into both tools' crosses.
+    static const int kBackOrders[3][3] = { { 0, 2, 1 }, { 1, 0, 2 }, { 2, 1, 0 } };
+    for (const auto& entry : groups) {
+        const vector<int>& members = entry.second;
+        bool several = false;
+        for (int s : members)
+            several = several || sides[s].brushIndex != sides[members[0]].brushIndex;
+        if (!several)
+            continue;
+
+        const SideGeom& lead = sides[members[0]];
+        PlaneD plane = lead.plane;
+        if (lead.planeSign < 0) {
+            for (double& c : plane.n)
+                c = -c;
+            plane.dist = -plane.dist;
+        }
+        const Vec3 n = { plane.n[0], plane.n[1], plane.n[2] };
+
+        vector<Vec3> all;
+        // Drawn faces keep the texture axis their own points gave, since the source UVs may only fit a
+        // texdef along it; nodraw faces have no UVs and take any stable axis (-1). Axes whose source
+        // components tie only shift or mirror the projection, which the texdef absorbs.
+        auto axisOf = [](int pick) { return pick < 2 ? 2 : pick < 4 ? 0 : 1; };
+        static const double tieTol = getenv("MAPEXP_TIE") ? atof(getenv("MAPEXP_TIE")) : 1e-5;
+        auto tied = [&](int a, int b) { return fabs(fabs(plane.n[axisOf(a)]) - fabs(plane.n[axisOf(b)])) < tieTol; };
+        vector<int> picks(members.size());
+        double limit = kPlaneFit;
+        bool same = true;
+        float first[4] = {};
+        for (size_t m = 0; m < members.size(); ++m) {
+            const SideGeom& side = sides[members[m]];
+            const FaceOut& face = brushes[side.brushIndex].faces[side.faceIndex];
+            all.insert(all.end(), side.winding.begin(), side.winding.end());
+            picks[m] = SideIsVisibleSolid(side.surfaceFlags) ? StableTexAxis(face.p) : -1;
+            const double err = ParsedPlaneError(side.plane, side.winding, face.p);
+            if (err < 1e30)
+                limit = max(limit, err);
+            float parsed[4];
+            if (!loaded(face.p, parsed)) {
+                same = false;
+                continue;
+            }
+            if (side.planeSign < 0) {
+                for (float& c : parsed)
+                    c = -c;
+            }
+            if (m == 0)
+                memcpy(first, parsed, sizeof(first));
+            else
+                same = same && parsed[0] == first[0] && parsed[1] == first[1] && parsed[2] == first[2]
+                    && parsed[3] == first[3];
+        }
+        if (same)
+            continue;
+
+        double best = 1e30;
+        vector<Vec3> chosen(3 * members.size()), trial(3 * members.size());
+        auto consider = [&](Vec3 cand[3]) {
+            if (Dot(PlaneFromPointsNormal(cand[0], cand[1], cand[2]), n) < 0.0)
+                swap(cand[1], cand[2]);
+            float ahead[4];
+            if (!loaded(cand, ahead))
+                return;
+            const int forward = StableTexAxis(cand);
+            int backPick[3] = { -2, -2, -2 };
+            Vec3 back[3][3];
+            for (size_t m = 0; m < members.size(); ++m) {
+                const int want = picks[m];
+                auto fits = [&](int pick) { return pick >= 0 && (want < 0 || pick == want || tied(pick, want)); };
+                Vec3* slot = &trial[3 * m];
+                if (sides[members[m]].planeSign > 0) {
+                    if (!fits(forward))
+                        return;
+                    slot[0] = cand[0];
+                    slot[1] = cand[1];
+                    slot[2] = cand[2];
+                    continue;
+                }
+                int use = -1;
+                for (int o = 0; o < 3 && use < 0; ++o) {
+                    if (backPick[o] == -2) {
+                        for (int k = 0; k < 3; ++k)
+                            back[o][k] = cand[kBackOrders[o][k]];
+                        float behind[4];
+                        backPick[o] = -1;
+                        if (loaded(back[o], behind) && behind[0] == -ahead[0] && behind[1] == -ahead[1]
+                            && behind[2] == -ahead[2] && fabsf(behind[3] + ahead[3]) <= 1e-4f)
+                            backPick[o] = StableTexAxis(back[o]);
+                    }
+                    if (fits(backPick[o]))
+                        use = o;
+                }
+                if (use < 0)
+                    return;
+                slot[0] = back[use][0];
+                slot[1] = back[use][1];
+                slot[2] = back[use][2];
+            }
+            const double err = ParsedPlaneError(plane, all, cand);
+            if (err < best) {
+                best = err;
+                chosen.swap(trial);
+            }
+        };
+        for (int s : members) {
+            const FaceOut& face = brushes[sides[s].brushIndex].faces[sides[s].faceIndex];
+            Vec3 cand[3] = { face.p[0], face.p[1], face.p[2] };
+            consider(cand);
+        }
+        Vec3 mid{ 0, 0, 0 };
+        for (const Vec3& p : all)
+            mid = Add(mid, p);
+        vector<Vec3> anchors = { Mul(mid, 1.0 / (double)all.size()) };
+        for (size_t m = 0; m < members.size() && anchors.size() < 5; ++m) {
+            const vector<Vec3>& w = sides[members[m]].winding;
+            Vec3 c{ 0, 0, 0 };
+            for (const Vec3& p : w)
+                c = Add(c, p);
+            anchors.push_back(Mul(c, 1.0 / (double)w.size()));
+        }
+        static const double spans[] = { 1024, 4096, 16384 };
+        static const double spins[] = { 0.0, 0.6 };
+        for (const Vec3& anchor : anchors) {
+            for (double span : spans) {
+                for (double spin : spins) {
+                    Vec3 cand[3];
+                    if (PreciseFacePoints(plane, anchor, span, spin, cand))
+                        consider(cand);
+                }
+            }
+        }
+        if (best > limit) {
+            ++gShareMiss;
+            if (getenv("MAPEXP_SHARE_DEBUG")) {
+                fprintf(stderr, "miss n=(%.7f %.7f %.7f) d=%.4f best=%g limit=%g members=%d\n", plane.n[0], plane.n[1],
+                        plane.n[2], plane.dist, best, limit, (int)members.size());
+                for (size_t m = 0; m < members.size() && m < 8; ++m) {
+                    const SideGeom& side = sides[members[m]];
+                    const FaceOut& face = brushes[side.brushIndex].faces[side.faceIndex];
+                    Vec3 back[3] = { face.p[0], face.p[2], face.p[1] };
+                    fprintf(stderr, "   brush %d sign %d shown %d want %d own %d ownback %d err %g area %.2f %s\n",
+                            side.brushIndex, side.planeSign, (int)SideIsVisibleSolid(side.surfaceFlags), picks[m],
+                            StableTexAxis(face.p), StableTexAxis(back),
+                            ParsedPlaneError(side.plane, side.winding, face.p), WindingArea(side.winding),
+                            face.material.c_str());
+                }
+            }
+            continue;
+        }
+        for (size_t m = 0; m < members.size(); ++m) {
+            FaceOut& face = brushes[sides[members[m]].brushIndex].faces[sides[members[m]].faceIndex];
+            face.p[0] = chosen[3 * m];
+            face.p[1] = chosen[3 * m + 1];
+            face.p[2] = chosen[3 * m + 2];
+        }
+        ++gShareGroups;
+        gShareFaces += (int)members.size();
+    }
+}
+
 ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, const vector<int>& matName,
                     const Names& names, int caulk, const CollisionSet* collision,
                     int& dropped, int& meshCount, int& vertCount, int& triMeshes)
@@ -4938,6 +5474,7 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
         }
     }
     ApplyPortalShapes(bsp, geo.brushes, allSides, brushSideStart);
+    ShareSourcePlanes(allSides, geo.brushes);
     vector<char> brushFace[2];
     FitAllBrushTextures(bsp, modelIndex, origin, matName, names, allSides, geo.brushes, brushFace);
 
@@ -6915,6 +7452,8 @@ ExportStats ExportBsp(const fs::path& bspPath, const fs::path& exeDir)
     cout << "drop reasons sides=" << gDropSides << " mat=" << gDropMat << " plane=" << gDropPlane
          << " faces=" << gDropFaces << " solid=" << gDropSolid
          << " edge=" << gWindingEdge << " hull=" << gWindingHull << " skip=" << gWindingSkip
+         << " bevel=" << gBevelDrop << " repick=" << gFaceRepick
+         << " share=" << gShareGroups << "/" << gShareFaces << " sharemiss=" << gShareMiss
          << " uvfull=" << gUvFull << " uvpart=" << gUvPartial << " uvfrac=" << gUvFracBad << endl;
     cout << "brush faces uvfit=" << gUvFit << " uvrep=" << gUvRep << " uvmiss=" << gUvMiss
          << " lmfit=" << gLmFit << " tridrop=" << gFaceTriDrop << " trikept=" << gFaceTriKept << endl;
