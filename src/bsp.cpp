@@ -287,6 +287,7 @@ BspFile LoadBsp(const wstring& path)
     BspFile bsp;
     bsp.version = version;
     bsp.materials = ReadArray<BspMaterial>(reader, chunks, kLumpMaterials);
+    bsp.lightBytes = ReadArray<unsigned char>(reader, chunks, kLumpLightBytes);
     bsp.planes = ReadArray<BspPlane>(reader, chunks, kLumpPlanes);
     bsp.portalVerts = ReadArray<BspPortalVert>(reader, chunks, kLumpPortalVerts);
     bsp.portals = ReadArray<BspPortal>(reader, chunks, kLumpPortals);

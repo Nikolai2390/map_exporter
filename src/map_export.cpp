@@ -78,11 +78,13 @@ struct WeldVert {
     float lm[2];
     float n[3];
     unsigned char color[4];
+    unsigned char lightmap = 31;
 };
 
 struct Tri {
     int a, b, c;
     int partner = -1;
+    int surface = -1;
 };
 
 struct Quad {
@@ -3454,8 +3456,12 @@ bool LightmapSpanSafe(float s0, float s1, float t0, float t1)
     return splits <= 32;
 }
 
+bool PrimarySubsampleSplit(const PatchCell& a, const PatchCell& b, const vector<WeldVert>& verts,
+                           const unsigned char* light, int lightBytes);
+
 bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& verts, unsigned contents,
-                       const string& material, vector<MeshOut>& dest, int& meshCount, int& vertCount)
+                       const string& material, vector<MeshOut>& dest, int& meshCount, int& vertCount,
+                       vector<PatchCell>* singles, const unsigned char* light, int lightBytes)
 {
     if (cells.empty())
         return false;
@@ -3565,7 +3571,7 @@ bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& v
                 for (int cu = 0; cu < cw; ++cu) {
                     auto found = grid.occ.find({ u0 + cu, v0 + cv });
                     if (found == grid.occ.end())
-                        return false;
+                        continue;
                     const PatchCell& cell = cells[found->second];
                     GridPos b = grid.vcoord[cell.B];
                     GridPos d = grid.vcoord[cell.D];
@@ -3589,55 +3595,98 @@ bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& v
             return true;
         };
 
-        for (const auto& item : grid.occ) {
-            if (taken.count(item.first))
-                continue;
-            int u0 = item.first.first;
-            int v0 = item.first.second;
-            int maxW = 0;
-            while (maxW < kMaxPatch - 1) {
-                pair<int, int> key{ u0 + maxW, v0 };
-                if (!grid.occ.count(key) || taken.count(key))
-                    break;
-                ++maxW;
+        if (!grid.occ.empty()) {
+            int minU = grid.occ.begin()->first.first;
+            int minV = grid.occ.begin()->first.second;
+            int maxU = minU;
+            int maxV = minV;
+            for (const auto& item : grid.occ) {
+                minU = min(minU, item.first.first);
+                minV = min(minV, item.first.second);
+                maxU = max(maxU, item.first.first);
+                maxV = max(maxV, item.first.second);
             }
-            int bestW = 1;
-            int bestH = 1;
-            for (int w = 1; w <= maxW; ++w) {
-                int h = 1;
-                while (h < kMaxPatch - 1) {
-                    bool rowOk = true;
-                    for (int u = 0; u < w && rowOk; ++u) {
-                        pair<int, int> key{ u0 + u, v0 + h };
-                        if (!grid.occ.count(key) || taken.count(key))
-                            rowOk = false;
+            const int spanU = maxU - minU + 1;
+            const int spanV = maxV - minV + 1;
+            bool filled = spanU <= kMaxPatch - 1 && spanV <= kMaxPatch - 1;
+            if (filled) {
+                for (int v = minV; v <= maxV && filled; ++v) {
+                    for (int u = minU; u <= maxU; ++u) {
+                        if (grid.occ.count({ u, v }))
+                            continue;
+                        // A missing cell whose four corners were already placed
+                        // is the one triangle the BSP did not keep.
+                        if (cornerId(u, v) < 0 || cornerId(u + 1, v) < 0
+                            || cornerId(u, v + 1) < 0 || cornerId(u + 1, v + 1) < 0)
+                            filled = false;
                     }
-                    if (!rowOk)
-                        break;
-                    ++h;
-                }
-                int fw = w;
-                int fh = h;
-                float s0, s1, t0, t1;
-                if (!lightBounds(u0, v0, fw, fh, s0, s1, t0, t1))
-                    continue;
-                (void)s0;
-                (void)s1;
-                (void)t0;
-                (void)t1;
-                int area = fw * fh;
-                int bestArea = bestW * bestH;
-                int span = min(fw, fh);
-                int bestSpan = min(bestW, bestH);
-                if (area > bestArea || (area == bestArea && (span > bestSpan || (span == bestSpan && fw > bestW)))) {
-                    bestW = fw;
-                    bestH = fh;
                 }
             }
-            if (!emitRect(u0, v0, bestW, bestH)) {
+            if (filled && emitRect(minU, minV, spanU, spanV)) {
+                for (const auto& item : grid.occ)
+                    taken[item.first] = 1;
+            }
+        }
+
+        // Emit the largest remaining rectangle each time. A one-cell corner
+        // must not be written first and cut through a larger original grid.
+        while (true) {
+            int bestU = 0;
+            int bestV = 0;
+            int bestW = 0;
+            int bestH = 0;
+            int bestArea = 0;
+            int bestSpan = 0;
+            for (const auto& item : grid.occ) {
+                if (taken.count(item.first))
+                    continue;
+                int u0 = item.first.first;
+                int v0 = item.first.second;
+                int maxW = 0;
+                while (maxW < kMaxPatch - 1) {
+                    pair<int, int> key{ u0 + maxW, v0 };
+                    if (!grid.occ.count(key) || taken.count(key))
+                        break;
+                    ++maxW;
+                }
+                for (int w = 1; w <= maxW; ++w) {
+                    int h = 1;
+                    while (h < kMaxPatch - 1) {
+                        bool rowOk = true;
+                        for (int u = 0; u < w && rowOk; ++u) {
+                            pair<int, int> key{ u0 + u, v0 + h };
+                            if (!grid.occ.count(key) || taken.count(key))
+                                rowOk = false;
+                        }
+                        if (!rowOk)
+                            break;
+                        ++h;
+                    }
+                    float s0, s1, t0, t1;
+                    if (!lightBounds(u0, v0, w, h, s0, s1, t0, t1))
+                        continue;
+                    (void)s0;
+                    (void)s1;
+                    (void)t0;
+                    (void)t1;
+                    const int area = w * h;
+                    const int span = min(w, h);
+                    if (area > bestArea || (area == bestArea && (span > bestSpan || (span == bestSpan && w > bestW)))) {
+                        bestArea = area;
+                        bestSpan = span;
+                        bestU = u0;
+                        bestV = v0;
+                        bestW = w;
+                        bestH = h;
+                    }
+                }
+            }
+            if (bestArea <= 0)
+                break;
+            if (!emitRect(bestU, bestV, bestW, bestH)) {
                 for (int cv = 0; cv < bestH; ++cv) {
                     for (int cu = 0; cu < bestW; ++cu) {
-                        auto found = grid.occ.find({ u0 + cu, v0 + cv });
+                        auto found = grid.occ.find({ bestU + cu, bestV + cv });
                         if (found != grid.occ.end() && !emitted[found->second])
                             EmitPatchCell(cells[found->second], verts, contents, material, dest, meshCount, vertCount);
                         if (found != grid.occ.end())
@@ -3647,7 +3696,7 @@ bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& v
             }
             for (int cv = 0; cv < bestH; ++cv)
                 for (int cu = 0; cu < bestW; ++cu)
-                    taken[{ u0 + cu, v0 + cv }] = 1;
+                    taken[{ bestU + cu, bestV + cv }] = 1;
         }
     };
 
@@ -3686,6 +3735,8 @@ bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& v
                     }
                     if (k < 0)
                         continue;
+                    if (PrimarySubsampleSplit(cur, nb, verts, light, lightBytes))
+                        continue;
                     int du = pj.u - pi.u;
                     int dv = pj.v - pi.v;
                     int ru = dv;
@@ -3702,11 +3753,19 @@ bool EmitStitchedPatch(const vector<PatchCell>& cells, const vector<WeldVert>& v
                 }
             }
         }
+        if (grid.occ.size() < 2) {
+            emitted[seed] = 0;
+            continue;
+        }
         emitGrid(grid);
     }
 
     for (int i = 0; i < (int)cells.size(); ++i) {
-        if (!emitted[i])
+        if (emitted[i])
+            continue;
+        if (singles)
+            singles->push_back(cells[i]);
+        else
             EmitPatchCell(cells[i], verts, contents, material, dest, meshCount, vertCount);
     }
     return true;
@@ -3739,10 +3798,198 @@ int AxisIndex(const vector<float>& centers, float v)
     return bestD <= kPatchSt ? best : -1;
 }
 
+// Secondary lightmap page: 512x512 BGRA. A step of 24 or more between two
+// terrain texels is the shade break that separates original meshes.
+constexpr int kLightmapTileBytes = 0x300000;
+constexpr int kLightmapPage = 512;
+constexpr int kShadeBreak = 24;
+
+bool SampleTerrainShade(const unsigned char* light, int lightBytes, int lightmap, float u, float v, int rgb[3])
+{
+    if (!light || lightBytes < kLightmapTileBytes || lightmap < 0 || lightmap >= 31)
+        return false;
+    if (lightBytes % kLightmapTileBytes != 0)
+        return false;
+    const int tiles = lightBytes / kLightmapTileBytes;
+    if (lightmap >= tiles)
+        return false;
+    int x = (int)floor((double)u * kLightmapPage);
+    int y = (int)floor((double)v * kLightmapPage);
+    if (x < 0)
+        x = 0;
+    if (y < 0)
+        y = 0;
+    if (x >= kLightmapPage)
+        x = kLightmapPage - 1;
+    if (y >= kLightmapPage)
+        y = kLightmapPage - 1;
+    const unsigned char* pixel = light + (size_t)lightmap * kLightmapTileBytes
+        + ((size_t)y * kLightmapPage + (size_t)x) * 4;
+    rgb[0] = pixel[2];
+    rgb[1] = pixel[1];
+    rgb[2] = pixel[0];
+    return true;
+}
+
+int ShadeDelta(const int a[3], const int b[3])
+{
+    return abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]);
+}
+
+bool CellAtlasShade(const vector<WeldVert>& verts, const PatchCell& cell,
+                    const unsigned char* light, int lightBytes, int rgb[3])
+{
+    const int ids[4] = { cell.A, cell.B, cell.C, cell.D };
+    const unsigned char page = verts[ids[0]].lightmap;
+    double u = 0;
+    double v = 0;
+    for (int id : ids) {
+        if (id < 0 || id >= (int)verts.size() || verts[id].lightmap != page)
+            return false;
+        if (verts[id].lm[0] < 0.f || verts[id].lm[0] > 1.f || verts[id].lm[1] < 0.f || verts[id].lm[1] > 1.f)
+            return false;
+        u += verts[id].lm[0];
+        v += verts[id].lm[1];
+    }
+    return SampleTerrainShade(light, lightBytes, page, (float)(u / 4.0), (float)(v / 4.0), rgb);
+}
+
+int LitPrimaryIsland(const unsigned char* prim, int page, float u, float v)
+{
+    struct Cache {
+        int pages = -1;
+        vector<vector<int>> ids;
+    };
+    static Cache cache;
+    if (page < 0)
+        return 0;
+    if ((int)cache.ids.size() <= page)
+        cache.ids.resize((size_t)page + 1);
+    if (cache.ids[page].empty()) {
+        vector<char> occ(512 * 512, 0);
+        for (int row = 0; row < 512; ++row) {
+            for (int col = 0; col < 512; ++col) {
+                int hi = 0;
+                for (int i = 0; i < 2; ++i)
+                    for (int j = 0; j < 2; ++j)
+                        hi = max(hi, (int)prim[(size_t)(row * 2 + i) * 1024u + (size_t)(col * 2 + j)]);
+                occ[(size_t)row * 512 + col] = hi >= 240;
+            }
+        }
+        vector<int> lab(512 * 512, 0);
+        vector<int> parent(1, 0);
+        int next = 1;
+        auto find = [&](int x) -> int {
+            int root = x;
+            while (parent[root] != root)
+                root = parent[root];
+            while (parent[x] != root) {
+                const int nextParent = parent[x];
+                parent[x] = root;
+                x = nextParent;
+            }
+            return root;
+        };
+        for (int row = 0; row < 512; ++row) {
+            for (int col = 0; col < 512; ++col) {
+                if (!occ[(size_t)row * 512 + col])
+                    continue;
+                const int left = col > 0 ? lab[(size_t)row * 512 + (col - 1)] : 0;
+                const int up = row > 0 ? lab[(size_t)(row - 1) * 512 + col] : 0;
+                const size_t at = (size_t)row * 512 + col;
+                if (left && up) {
+                    lab[at] = left;
+                    const int rl = find(left);
+                    const int ru = find(up);
+                    if (rl != ru)
+                        parent[ru] = rl;
+                } else if (left || up) {
+                    lab[at] = left ? left : up;
+                } else {
+                    lab[at] = next;
+                    parent.push_back(next);
+                    ++next;
+                }
+            }
+        }
+        for (int i = 0; i < 512 * 512; ++i)
+            if (lab[i])
+                lab[i] = find(lab[i]);
+        cache.ids[page] = move(lab);
+    }
+    if (u < 0.f || u > 1.f || v < 0.f || v > 1.f)
+        return 0;
+    const int col = min(511, max(0, (int)floor((double)u * 512.0)));
+    const int row = min(511, max(0, (int)floor((double)v * 512.0)));
+    return cache.ids[page][(size_t)row * 512 + col];
+}
+
+// lighting.c writes four primary samples at (col*2, row*2) for one lightmap texel.
+// A texel that is both full and empty is the unfilled chart edge between patches.
+bool PrimarySubsampleSplit(const PatchCell& a, const PatchCell& b, const vector<WeldVert>& verts,
+                           const unsigned char* light, int lightBytes)
+{
+    int shared[2];
+    int count = 0;
+    const int av[4] = { a.A, a.B, a.C, a.D };
+    const int bv[4] = { b.A, b.B, b.C, b.D };
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            if (av[i] == bv[j] && count < 2)
+                shared[count++] = av[i];
+        }
+    }
+    if (count != 2 || !light || lightBytes < kLightmapTileBytes || (lightBytes % kLightmapTileBytes) != 0)
+        return false;
+    const int page = verts[shared[0]].lightmap;
+    const int tiles = lightBytes / kLightmapTileBytes;
+    if (page < 0 || page >= tiles || verts[shared[1]].lightmap != page)
+        return false;
+    const double u = ((double)verts[shared[0]].lm[0] + (double)verts[shared[1]].lm[0]) * 0.5;
+    const double v = ((double)verts[shared[0]].lm[1] + (double)verts[shared[1]].lm[1]) * 0.5;
+    if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0)
+        return false;
+    const int col = min(511, max(0, (int)floor(u * 512.0)));
+    const int row = min(511, max(0, (int)floor(v * 512.0)));
+    const unsigned char* prim = light + (size_t)page * kLightmapTileBytes + 0x200000;
+    int lo = 255;
+    int hi = 0;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            const int sample = prim[(size_t)(row * 2 + i) * 1024u + (size_t)(col * 2 + j)];
+            lo = min(lo, sample);
+            hi = max(hi, sample);
+        }
+    }
+    if (lo <= 16 && hi >= 240)
+        return true;
+    auto centroid = [&](const PatchCell& cell, double& cu, double& cv) -> bool {
+        const int ids[4] = { cell.A, cell.B, cell.C, cell.D };
+        cu = 0;
+        cv = 0;
+        for (int id : ids) {
+            if (verts[id].lightmap != page)
+                return false;
+            cu += verts[id].lm[0];
+            cv += verts[id].lm[1];
+        }
+        cu *= 0.25;
+        cv *= 0.25;
+        return true;
+    };
+    double acu, acv, bcu, bcv;
+    if (!centroid(a, acu, acv) || !centroid(b, bcu, bcv))
+        return false;
+    const unsigned char* primBase = light + (size_t)page * kLightmapTileBytes + 0x200000;
+    const int ia = LitPrimaryIsland(primBase, page, (float)acu, (float)acv);
+    const int ib = LitPrimaryIsland(primBase, page, (float)bcu, (float)bcv);
+    return ia > 0 && ib > 0 && ia != ib;
+}
+
 // The authored lightmap texcoord, scaled into the BSP, is the original control grid.
 void EmitLightmapLattices(const vector<PatchCell>& cells, const vector<WeldVert>& verts, unsigned contents,
                           const string& material, vector<MeshOut>& dest, int& meshCount, int& vertCount,
-                          vector<char>& consumed)
+                          vector<char>& consumed, const unsigned char* light, int lightBytes)
 {
     if (cells.empty())
         return;
@@ -3913,6 +4160,125 @@ void EmitLightmapLattices(const vector<PatchCell>& cells, const vector<WeldVert>
                 occupant[(size_t)lc.v0 * cellsW + lc.u0] = f;
             }
 
+            // Neighbor shade steps. A border is a step that stands above the
+            // steps around it. The flat triangle shading inside one mesh does not.
+            struct ShadeEdge { int u, v, nu, nv, delta; };
+            vector<ShadeEdge> shadeEdges;
+            vector<vector<int>> shadeAt((size_t)cellsW * cellsH);
+            const int step4[4][2] = { { 1, 0 }, { 0, 1 } };
+            for (int v = 0; v < cellsH; ++v) {
+                for (int u = 0; u < cellsW; ++u) {
+                    size_t at = (size_t)v * cellsW + u;
+                    if (occupant[at] < 0)
+                        continue;
+                    for (int n = 0; n < 2; ++n) {
+                        const int nu = u + step4[n][0];
+                        const int nv = v + step4[n][1];
+                        if (nu >= cellsW || nv >= cellsH)
+                            continue;
+                        size_t next = (size_t)nv * cellsW + nu;
+                        if (occupant[next] < 0)
+                            continue;
+                        int leftRgb[3], rightRgb[3];
+                        if (!CellAtlasShade(verts, cells[found[occupant[at]].cell], light, lightBytes, leftRgb)
+                            || !CellAtlasShade(verts, cells[found[occupant[next]].cell], light, lightBytes, rightRgb))
+                            continue;
+                        ShadeEdge edge;
+                        edge.u = u;
+                        edge.v = v;
+                        edge.nu = nu;
+                        edge.nv = nv;
+                        edge.delta = ShadeDelta(leftRgb, rightRgb);
+                        shadeAt[at].push_back(edge.delta);
+                        shadeAt[next].push_back(edge.delta);
+                        shadeEdges.push_back(edge);
+                    }
+                }
+            }
+            auto localMedian = [&](size_t at, int skip) {
+                vector<int> values = shadeAt[at];
+                auto skipAt = std::find(values.begin(), values.end(), skip);
+                if (skipAt != values.end())
+                    values.erase(skipAt);
+                if (values.empty())
+                    return -1;
+                sort(values.begin(), values.end());
+                return values[values.size() / 2];
+            };
+            struct CutKey {
+                int u, v, nu, nv;
+                bool operator==(const CutKey& o) const
+                {
+                    return u == o.u && v == o.v && nu == o.nu && nv == o.nv;
+                }
+            };
+            struct CutHash {
+                size_t operator()(const CutKey& k) const
+                {
+                    return ((size_t)k.u * 73856093u) ^ ((size_t)k.v * 19349663u)
+                        ^ ((size_t)k.nu * 83492791u) ^ (size_t)k.nv;
+                }
+            };
+            unordered_set<CutKey, CutHash> shadeCut;
+            for (const ShadeEdge& edge : shadeEdges) {
+                const size_t at = (size_t)edge.v * cellsW + edge.u;
+                const size_t next = (size_t)edge.nv * cellsW + edge.nu;
+                const int leftMed = localMedian(at, edge.delta);
+                const int rightMed = localMedian(next, edge.delta);
+                const int base = leftMed < 0 ? rightMed : rightMed < 0 ? leftMed : min(leftMed, rightMed);
+                // One and a half times the surrounding steps, and at least 16.
+                // Flat facet shading inside a mesh stays joined.
+                const bool shadeStep = base < 0
+                    ? edge.delta >= kShadeBreak
+                    : edge.delta >= 16 && edge.delta > base + base / 2;
+                const bool chartCut = PrimarySubsampleSplit(
+                    cells[found[occupant[at]].cell], cells[found[occupant[next]].cell],
+                    verts, light, lightBytes);
+                if (shadeStep || chartCut) {
+                    CutKey key{ edge.u, edge.v, edge.nu, edge.nv };
+                    shadeCut.insert(key);
+                }
+            }
+            auto cutBetween = [&](int u, int v, int nu, int nv) {
+                if (nu < u || (nu == u && nv < v)) {
+                    swap(u, nu);
+                    swap(v, nv);
+                }
+                return shadeCut.count(CutKey{ u, v, nu, nv }) != 0;
+            };
+
+            vector<int> shadeRegion((size_t)cellsW * cellsH, -1);
+            int shadeRegions = 0;
+            for (int v = 0; v < cellsH; ++v) {
+                for (int u = 0; u < cellsW; ++u) {
+                    size_t at = (size_t)v * cellsW + u;
+                    if (occupant[at] < 0 || shadeRegion[at] >= 0)
+                        continue;
+                    const int regionId = shadeRegions++;
+                    queue<pair<int, int>> pending;
+                    shadeRegion[at] = regionId;
+                    pending.push({ u, v });
+                    while (!pending.empty()) {
+                        const pair<int, int> cur = pending.front();
+                        pending.pop();
+                        const int nb[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                        for (int n = 0; n < 4; ++n) {
+                            const int nu = cur.first + nb[n][0];
+                            const int nv = cur.second + nb[n][1];
+                            if (nu < 0 || nv < 0 || nu >= cellsW || nv >= cellsH)
+                                continue;
+                            size_t next = (size_t)nv * cellsW + nu;
+                            if (occupant[next] < 0 || shadeRegion[next] >= 0)
+                                continue;
+                            if (cutBetween(cur.first, cur.second, nu, nv))
+                                continue;
+                            shadeRegion[next] = regionId;
+                            pending.push({ nu, nv });
+                        }
+                    }
+                }
+            }
+
             const int maxCells = kMaxPatch - 1;
             vector<int> run((size_t)cellsW * cellsH, 0);
             while (true) {
@@ -3921,16 +4287,22 @@ void EmitLightmapLattices(const vector<PatchCell>& cells, const vector<WeldVert>
                         size_t at = (size_t)v * cellsW + u;
                         if (occupant[at] < 0)
                             run[at] = 0;
+                        else if (v + 1 < cellsH && shadeRegion[at + cellsW] == shadeRegion[at])
+                            run[at] = min(maxCells, 1 + run[at + cellsW]);
                         else
-                            run[at] = min(maxCells, 1 + (v + 1 < cellsH ? run[at + cellsW] : 0));
+                            run[at] = 1;
                     }
                 }
                 int bu = 0, bv = 0, bw = 0, bh = 0;
                 for (int v0 = 0; v0 < cellsH; ++v0) {
                     for (int u0 = 0; u0 < cellsW; ++u0) {
                         int h = maxCells;
+                        const int rowRegion = shadeRegion[(size_t)v0 * cellsW + u0];
                         for (int w = 1; w <= maxCells && u0 + w - 1 < cellsW; ++w) {
-                            h = min(h, run[(size_t)v0 * cellsW + u0 + w - 1]);
+                            size_t col = (size_t)v0 * cellsW + u0 + w - 1;
+                            if (shadeRegion[col] != rowRegion)
+                                break;
+                            h = min(h, run[col]);
                             if (h == 0)
                                 break;
                             if (w * h > bw * bh) {
@@ -3990,7 +4362,8 @@ bool IntegerStDelta(float fromCoord, float toCoord, int& delta)
 // LmapMergeGroups joins terrain surfaces that meet at a point whose lightmap coordinates
 // differ by one integer texel shift. The joined surface is one patch.
 bool LinkTerrainLightmaps(const vector<WeldVert>& src, const vector<Tri>& tris,
-                          vector<WeldVert>& dst, vector<Tri>& outTris)
+                          vector<WeldVert>& dst, vector<Tri>& outTris,
+                          const unsigned char* light, int lightBytes)
 {
     dst.clear();
     outTris.clear();
@@ -4064,6 +4437,8 @@ bool LinkTerrainLightmaps(const vector<WeldVert>& src, const vector<Tri>& tris,
         int count = 0;
         bool set = false;
         bool bad = false;
+        vector<int> cross;
+        vector<int> inside;
     };
     unordered_map<Cell, vector<pair<int, int>>, CellHash> grid;
     auto cellOf = [](const Vec3& p) {
@@ -4119,6 +4494,48 @@ bool LinkTerrainLightmaps(const vector<WeldVert>& src, const vector<Tri>& tris,
                                 acc.bad = true;
                             }
                             acc.count++;
+                            auto componentShade = [&](int vertId, int comp, int rgb[3]) {
+                                auto trisAt = vertTris.find(vertId);
+                                if (trisAt == vertTris.end())
+                                    return false;
+                                for (int triIndex : trisAt->second) {
+                                    if (triComp[triIndex] != comp)
+                                        continue;
+                                    const Tri& tri = tris[triIndex];
+                                    const int ids[3] = { tri.a, tri.b, tri.c };
+                                    if (ids[0] < 0 || ids[0] >= (int)src.size())
+                                        continue;
+                                    const unsigned char page = src[ids[0]].lightmap;
+                                    double u = 0;
+                                    double v = 0;
+                                    bool usable = true;
+                                    for (int id : ids) {
+                                        if (id < 0 || id >= (int)src.size() || src[id].lightmap != page) {
+                                            usable = false;
+                                            break;
+                                        }
+                                        u += src[id].lm[0];
+                                        v += src[id].lm[1];
+                                    }
+                                    if (!usable)
+                                        continue;
+                                    return SampleTerrainShade(light, lightBytes, page, (float)(u / 3.0), (float)(v / 3.0), rgb);
+                                }
+                                return false;
+                            };
+                            int leftRgb[3], rightRgb[3];
+                            if (componentShade(left.second, loComp, leftRgb)
+                                && componentShade(right.second, hiComp, rightRgb)) {
+                                int vertRgb[3];
+                                const int across = ShadeDelta(leftRgb, rightRgb);
+                                int local = 0;
+                                if (SampleTerrainShade(light, lightBytes, a.lightmap, a.lm[0], a.lm[1], vertRgb))
+                                    local = max(local, ShadeDelta(leftRgb, vertRgb));
+                                if (SampleTerrainShade(light, lightBytes, b.lightmap, b.lm[0], b.lm[1], vertRgb))
+                                    local = max(local, ShadeDelta(rightRgb, vertRgb));
+                                acc.cross.push_back(across);
+                                acc.inside.push_back(local);
+                            }
                         }
                     }
                 }
@@ -4132,6 +4549,16 @@ bool LinkTerrainLightmaps(const vector<WeldVert>& src, const vector<Tri>& tris,
         const Acc& acc = item.second;
         if (!acc.set || acc.bad || acc.count < 2)
             continue;
+        if (!acc.cross.empty()) {
+            vector<int> across = acc.cross;
+            vector<int> local = acc.inside;
+            sort(across.begin(), across.end());
+            sort(local.begin(), local.end());
+            const int acrossMed = across[across.size() / 2];
+            const int localMed = local[local.size() / 2];
+            if (acrossMed >= 16 && acrossMed > localMed + localMed / 2)
+                continue;
+        }
         int lo = item.first.first;
         int hi = item.first.second;
         links[lo].push_back({ hi, acc.ds, acc.dt, acc.ls, acc.lt });
@@ -4279,7 +4706,8 @@ bool LinkTerrainLightmaps(const vector<WeldVert>& src, const vector<Tri>& tris,
 }
 
 void BuildMeshes(const vector<WeldVert>& verts, const vector<Tri>& tris, unsigned contents,
-                 const string& material, vector<MeshOut>& dest, int& meshCount, int& vertCount, int& triMeshes)
+                 const string& material, vector<MeshOut>& dest, int& meshCount, int& vertCount, int& triMeshes,
+                 const unsigned char* light, int lightBytes)
 {
     if (tris.empty())
         return;
@@ -4350,13 +4778,14 @@ void BuildMeshes(const vector<WeldVert>& verts, const vector<Tri>& tris, unsigne
     take(stCells);
     take(longCells);
     vector<char> lattice(cells.size(), 0);
-    EmitLightmapLattices(cells, verts, contents, material, dest, meshCount, vertCount, lattice);
+    EmitLightmapLattices(cells, verts, contents, material, dest, meshCount, vertCount, lattice, light, lightBytes);
     vector<PatchCell> rest;
+    rest.reserve(cells.size());
     for (int i = 0; i < (int)cells.size(); ++i) {
         if (!lattice[i])
             rest.push_back(cells[i]);
     }
-    EmitStitchedPatch(rest, verts, contents, material, dest, meshCount, vertCount);
+    EmitStitchedPatch(rest, verts, contents, material, dest, meshCount, vertCount, nullptr, light, lightBytes);
     for (int i = 0; i < (int)tris.size(); ++i) {
         if (!used[i])
             EmitLooseTri(tris[i], verts, contents, material, dest, meshCount, vertCount, triMeshes);
@@ -5498,7 +5927,7 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
     auto weldCell = [](const Vec3& p) {
         return WeldCell{ (int)floor(p.x / kPatchWeld), (int)floor(p.y / kPatchWeld), (int)floor(p.z / kPatchWeld) };
     };
-    auto weldPoint = [&](const BspDrawVert& vert, StOffset off) -> int {
+    auto weldPoint = [&](const BspDrawVert& vert, StOffset off, unsigned char lightmapIndex) -> int {
         Vec3 p = FromVert(vert, origin);
         double st0 = (double)vert.texCoord[0] + off.s;
         double st1 = (double)vert.texCoord[1] + off.t;
@@ -5538,6 +5967,7 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
         out.n[1] = vert.normal[1];
         out.n[2] = vert.normal[2];
         memcpy(out.color, vert.color, 4);
+        out.lightmap = lightmapIndex;
         int id = (int)weld.size();
         weld.push_back(out);
         weldGrid[cell].push_back(id);
@@ -5558,43 +5988,6 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
             bool brushDup = false;
         };
         vector<KeptTri> kept;
-        auto sharesEdge = [](const Tri& p, const Tri& q) {
-            int va[3] = { p.a, p.b, p.c };
-            int vb[3] = { q.a, q.b, q.c };
-            int common = 0;
-            bool used[3] = {};
-            for (int s = 0; s < 3; ++s) {
-                for (int t = 0; t < 3; ++t) {
-                    if (!used[t] && va[s] == vb[t]) {
-                        used[t] = true;
-                        common++;
-                        break;
-                    }
-                }
-            }
-            if (common != 2)
-                return false;
-            int uniq[6];
-            int n = 0;
-            for (int v : va) {
-                bool seen = false;
-                for (int k = 0; k < n; ++k)
-                    seen = seen || uniq[k] == v;
-                if (!seen)
-                    uniq[n++] = v;
-            }
-            for (int v : vb) {
-                bool seen = false;
-                for (int k = 0; k < n; ++k)
-                    seen = seen || uniq[k] == v;
-                if (!seen) {
-                    if (n == 6)
-                        return false;
-                    uniq[n++] = v;
-                }
-            }
-            return n == 4;
-        };
         for (int i = 0; i + 2 < soup.indexCount; i += 3) {
             int ia = ResolveVert(soup, bsp.indices[type], i, (int)bsp.verts[type].size());
             int ib = ResolveVert(soup, bsp.indices[type], i + 1, (int)bsp.verts[type].size());
@@ -5647,28 +6040,108 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
                 continue;
 
             Tri tri;
-            tri.a = weldPoint(bsp.verts[type][ia], off);
-            tri.b = weldPoint(bsp.verts[type][ib], off);
-            tri.c = weldPoint(bsp.verts[type][ic], off);
+            tri.a = weldPoint(bsp.verts[type][ia], off, soup.lightmapIndex);
+            tri.b = weldPoint(bsp.verts[type][ib], off, soup.lightmapIndex);
+            tri.c = weldPoint(bsp.verts[type][ic], off, soup.lightmapIndex);
+            tri.surface = serial;
             kept.push_back({ { nameId, contents }, tri, i, brushDup });
         }
+        auto sharesEdge = [](const Tri& p, const Tri& q) {
+            int n = 0;
+            int id[3] = { p.a, p.b, p.c };
+            int other[3] = { q.a, q.b, q.c };
+            for (int s = 0; s < 3; ++s) {
+                for (int t = 0; t < 3; ++t) {
+                    if (id[s] == other[t])
+                        ++n;
+                }
+            }
+            return n == 2;
+        };
+        // The two triangles of one terrain cell share a diagonal, so the
+        // midpoint of that edge matches the midpoint of the other two verts.
+        // The grid side shared with the next cell does not.
+        auto quadMidpointError = [&](const Tri& p, const Tri& q) {
+            int shared[2];
+            int count = 0;
+            int uniqueP = -1;
+            int uniqueQ = -1;
+            int pv[3] = { p.a, p.b, p.c };
+            int qv[3] = { q.a, q.b, q.c };
+            for (int i = 0; i < 3; ++i) {
+                bool hit = false;
+                for (int j = 0; j < 3; ++j) {
+                    if (pv[i] == qv[j])
+                        hit = true;
+                }
+                if (hit) {
+                    if (count < 2)
+                        shared[count] = pv[i];
+                    ++count;
+                } else {
+                    uniqueP = pv[i];
+                }
+            }
+            for (int j = 0; j < 3; ++j) {
+                bool hit = false;
+                for (int s = 0; s < count && s < 2; ++s) {
+                    if (qv[j] == shared[s])
+                        hit = true;
+                }
+                if (!hit)
+                    uniqueQ = qv[j];
+            }
+            if (count != 2 || uniqueP < 0 || uniqueQ < 0)
+                return 1.0e9;
+            const Vec3& s0 = weld[shared[0]].p;
+            const Vec3& s1 = weld[shared[1]].p;
+            const Vec3 midShared{ (s0.x + s1.x) * 0.5, (s0.y + s1.y) * 0.5, (s0.z + s1.z) * 0.5 };
+            const Vec3& u0 = weld[uniqueP].p;
+            const Vec3& u1 = weld[uniqueQ].p;
+            const Vec3 midUnique{ (u0.x + u1.x) * 0.5, (u0.y + u1.y) * 0.5, (u0.z + u1.z) * 0.5 };
+            const double edge = Len(Sub(s0, s1));
+            if (edge < 1.0e-4)
+                return 1.0e9;
+            return Len(Sub(midShared, midUnique)) / edge;
+        };
         vector<char> emitted(kept.size(), 0);
-        for (int k = 0; k + 1 < (int)kept.size(); ++k) {
-            int n0 = kept[k].indexStart / 3;
-            int n1 = kept[k + 1].indexStart / 3;
-            if ((n0 % 2) != 0 || n1 != n0 + 1)
-                continue;
-            if (!(kept[k].key == kept[k + 1].key) || !sharesEdge(kept[k].tri, kept[k + 1].tri))
-                continue;
-            if (kept[k].brushDup || kept[k + 1].brushDup)
-                continue;
+        auto pushPair = [&](int k) {
             auto& dest = buckets[kept[k].key];
-            int ia = (int)dest.size();
+            const int ia = (int)dest.size();
             dest.push_back(kept[k].tri);
             dest.push_back(kept[k + 1].tri);
             dest[ia].partner = ia + 1;
             dest[ia + 1].partner = ia;
             emitted[k] = emitted[k + 1] = 1;
+        };
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int k = 0; k + 1 < (int)kept.size(); ++k) {
+                if (emitted[k] || emitted[k + 1] || kept[k].brushDup || kept[k + 1].brushDup)
+                    continue;
+                if (kept[k + 1].indexStart != kept[k].indexStart + 3)
+                    continue;
+                if (!(kept[k].key == kept[k + 1].key) || !sharesEdge(kept[k].tri, kept[k + 1].tri))
+                    continue;
+                const int n0 = kept[k].indexStart / 3;
+                if (pass == 0) {
+                    PatchCell cell;
+                    if (!LabelPatchCell(kept[k].tri, kept[k + 1].tri, weld, cell))
+                        continue;
+                    if (!DiagonalInSt(cell, weld) && !DiagonalInLightmap(cell, weld))
+                        continue;
+                } else if ((n0 % 2) != 0) {
+                    continue;
+                } else if (k > 0 && !emitted[k - 1] && !kept[k - 1].brushDup
+                           && kept[k].indexStart == kept[k - 1].indexStart + 3
+                           && (kept[k].key == kept[k - 1].key)
+                           && sharesEdge(kept[k - 1].tri, kept[k].tri)
+                           && quadMidpointError(kept[k - 1].tri, kept[k].tri)
+                               < quadMidpointError(kept[k].tri, kept[k + 1].tri)) {
+                    pushPair(k - 1);
+                    continue;
+                }
+                pushPair(k);
+            }
         }
         for (int k = 0; k < (int)kept.size(); ++k) {
             if (emitted[k] || kept[k].brushDup)
@@ -5692,18 +6165,20 @@ ModelGeo BuildModel(const BspFile& bsp, int modelIndex, const Vec3& origin, cons
             surface.push_back(bucket.second[i]);
         }
         for (Tri& tri : surface) {
-            int partner = tri.partner;
+            const int partner = tri.partner;
             if (partner < 0 || partner >= (int)remap.size() || remap[partner] < 0)
                 tri.partner = -1;
             else
                 tri.partner = remap[partner];
         }
+        const unsigned char* light = bsp.lightBytes.empty() ? nullptr : bsp.lightBytes.data();
+        const int lightBytes = (int)bsp.lightBytes.size();
         vector<WeldVert> linkedVerts;
         vector<Tri> linkedTris;
-        if (LinkTerrainLightmaps(weld, surface, linkedVerts, linkedTris))
-            BuildMeshes(linkedVerts, linkedTris, bucket.first.contents, material, geo.meshes, meshCount, vertCount, triMeshes);
+        if (LinkTerrainLightmaps(weld, surface, linkedVerts, linkedTris, light, lightBytes))
+            BuildMeshes(linkedVerts, linkedTris, bucket.first.contents, material, geo.meshes, meshCount, vertCount, triMeshes, light, lightBytes);
         else
-            BuildMeshes(weld, surface, bucket.first.contents, material, geo.meshes, meshCount, vertCount, triMeshes);
+            BuildMeshes(weld, surface, bucket.first.contents, material, geo.meshes, meshCount, vertCount, triMeshes, light, lightBytes);
     }
 
     if (geo.brushes.empty() && geo.meshes.empty() && model.numSurfaces > 0) {

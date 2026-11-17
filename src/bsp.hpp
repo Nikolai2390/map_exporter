@@ -10,6 +10,7 @@ static constexpr int kBspIdent = ('P' << 24) | ('S' << 16) | ('B' << 8) | 'I';
 
 enum BspLump : int {
     kLumpMaterials = 0,
+    kLumpLightBytes = 1,
     kLumpPlanes = 4,
     kLumpBrushSides = 5,
     kLumpBrushSideEdgeCounts = 6,
@@ -186,6 +187,9 @@ struct BspFile {
     string entities;
     vector<BspProbe> probes;
     vector<BspPrimaryLight> primaryLights;
+    // LUMP_LIGHTBYTES. Each tile is 0x300000 bytes: 512x512 BGRA, a second
+    // 512x512 BGRA page, then the 1024 primary page.
+    vector<unsigned char> lightBytes;
 };
 
 BspFile LoadBsp(const wstring& path);
